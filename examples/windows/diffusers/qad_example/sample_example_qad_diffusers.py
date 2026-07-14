@@ -50,13 +50,14 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from ltx_core.text_encoders.gemma import convert_to_additive_mask
 
 # LTX imports
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.model_loader import load_transformer
 from ltx_trainer.timestep_samplers import SAMPLERS
-from ltx_trainer.trainer import LtxvTrainer
+from ltx_trainer.trainer import LtxvTrainer, TrainingStepOutput
 from ltx_trainer.training_strategies import get_training_strategy
 from torch.utils.data import DataLoader
 
@@ -241,14 +242,21 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return result
 
 
-def apply_connectors(batch, text_encoder):
-    """Apply text encoder connectors to transform pre-computed prompt embeddings."""
+def apply_connectors(batch, embeddings_processor):
+    """Apply the current LTX embeddings processor to precomputed features."""
     conditions = batch["conditions"]
-    device = conditions["prompt_embeds"].device
-    text_encoder.to(device)
-
-    video_embeds, audio_embeds, attention_mask = text_encoder._run_connectors(
-        conditions["prompt_embeds"], conditions["prompt_attention_mask"]
+    if "video_prompt_embeds" in conditions:
+        video_features = conditions["video_prompt_embeds"]
+        audio_features = conditions.get("audio_prompt_embeds")
+    else:
+        video_features = conditions["prompt_embeds"]
+        audio_features = conditions["prompt_embeds"]
+    additive_mask = convert_to_additive_mask(
+        conditions["prompt_attention_mask"], video_features.dtype
+    )
+    embeddings_processor.to(video_features.device)
+    video_embeds, audio_embeds, attention_mask = embeddings_processor.create_embeddings(
+        video_features, audio_features, additive_mask
     )
     conditions["video_prompt_embeds"] = video_embeds
     conditions["audio_prompt_embeds"] = audio_embeds
@@ -361,10 +369,6 @@ class LtxvQADTrainer(LtxvTrainer):
         self._run_calibration()
         self._setup_distillation()
 
-        self._vae_decoder = self._vae_decoder.to("cpu")
-        if self._vae_encoder is not None:
-            self._vae_encoder = self._vae_encoder.to("cpu")
-
         self._transformer.to(torch.bfloat16)
         self._transformer = self._accelerator.prepare(self._transformer)
 
@@ -384,7 +388,7 @@ class LtxvQADTrainer(LtxvTrainer):
         if not hasattr(self, "_training_strategy") or self._training_strategy is None:
             self._training_strategy = get_training_strategy(self._config.training_strategy)
 
-        data_sources = self._training_strategy.get_data_sources()
+        data_sources = self._config.training_strategy.get_data_sources()
         dataset = PrecomputedDataset(
             self._config.data.preprocessed_data_root,
             data_sources=data_sources,
@@ -404,11 +408,10 @@ class LtxvQADTrainer(LtxvTrainer):
         calib_steps = min(self._calib_size, len(dataset))
         strategy = self._training_strategy
         device = self._accelerator.device
-        text_encoder = self._text_encoder
+        embeddings_processor = self._embeddings_processor
 
         self._transformer.to(device)
-        if text_encoder is not None:
-            text_encoder.to(device)
+        embeddings_processor.to(device)
 
         def calibration_forward_loop(model):
             model.eval()
@@ -425,8 +428,8 @@ class LtxvQADTrainer(LtxvTrainer):
                     batch = move_batch_to_device(batch, device)
 
                     try:
-                        if text_encoder is not None and "conditions" in batch:
-                            apply_connectors(batch, text_encoder)
+                        if "conditions" in batch:
+                            apply_connectors(batch, embeddings_processor)
 
                         model_inputs = strategy.prepare_training_inputs(batch, timestep_sampler)
                         model(
@@ -493,13 +496,7 @@ class LtxvQADTrainer(LtxvTrainer):
 
     def _training_step(self, batch):
         """Override: use strategy's loss + add distillation loss."""
-        conditions = batch["conditions"]
-        video_embeds, audio_embeds, attention_mask = self._text_encoder._run_connectors(
-            conditions["prompt_embeds"], conditions["prompt_attention_mask"]
-        )
-        conditions["video_prompt_embeds"] = video_embeds
-        conditions["audio_prompt_embeds"] = audio_embeds
-        conditions["prompt_attention_mask"] = attention_mask
+        apply_connectors(batch, self._embeddings_processor)
 
         model_inputs = self._training_strategy.prepare_training_inputs(
             batch, self._timestep_sampler
@@ -513,10 +510,15 @@ class LtxvQADTrainer(LtxvTrainer):
         hard_loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
 
         unwrapped = self._accelerator.unwrap_model(self._transformer)
+        loss = hard_loss
         if isinstance(unwrapped, DistillationModel) and unwrapped.training:
-            return unwrapped.compute_kd_loss(student_loss=hard_loss)
+            loss = unwrapped.compute_kd_loss(student_loss=hard_loss)
 
-        return hard_loss
+        if model_inputs.video is not None and model_inputs.video.enabled:
+            sigma = model_inputs.video.sigma.detach()
+        else:
+            sigma = model_inputs.audio.sigma.detach()
+        return TrainingStepOutput(loss=loss, sigma=sigma)
 
     # ── Checkpoint saving ─────────────────────────────────────────────────
 
