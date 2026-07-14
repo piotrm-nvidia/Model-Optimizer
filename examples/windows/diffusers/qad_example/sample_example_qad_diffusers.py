@@ -365,11 +365,11 @@ class LtxvQADTrainer(LtxvTrainer):
         self._transformer.set_gradient_checkpointing(
             self._config.optimization.enable_gradient_checkpointing
         )
+        self._transformer.to(torch.bfloat16)
 
         self._run_calibration()
         self._setup_distillation()
 
-        self._transformer.to(torch.bfloat16)
         self._transformer = self._accelerator.prepare(self._transformer)
 
         gc.collect()
