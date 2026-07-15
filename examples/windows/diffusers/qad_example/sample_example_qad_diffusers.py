@@ -512,7 +512,7 @@ class LtxvQADTrainer(LtxvTrainer):
         unwrapped = self._accelerator.unwrap_model(self._transformer)
         loss = hard_loss
         if isinstance(unwrapped, DistillationModel) and unwrapped.training:
-            loss = unwrapped.compute_kd_loss(student_loss=hard_loss.mean())
+            loss = unwrapped.compute_kd_loss(student_loss=hard_loss.mean()).expand_as(hard_loss)
 
         if model_inputs.video is not None and model_inputs.video.enabled:
             sigma = model_inputs.video.sigma.detach()
