@@ -242,6 +242,16 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return result
 
 
+def cast_batch_latents(batch: dict, dtype: torch.dtype) -> None:
+    """Cast precomputed modality latents to the QAD transformer compute dtype."""
+    for value in batch.values():
+        if not isinstance(value, dict):
+            continue
+        latents = value.get("latents")
+        if isinstance(latents, torch.Tensor) and latents.is_floating_point():
+            value["latents"] = latents.to(dtype=dtype)
+
+
 def apply_connectors(batch, embeddings_processor):
     """Apply the current LTX embeddings processor to precomputed features."""
     conditions = batch["conditions"]
@@ -426,6 +436,7 @@ class LtxvQADTrainer(LtxvTrainer):
                         batch = next(data_iter)
 
                     batch = move_batch_to_device(batch, device)
+                    cast_batch_latents(batch, torch.bfloat16)
 
                     try:
                         if "conditions" in batch:
@@ -496,6 +507,7 @@ class LtxvQADTrainer(LtxvTrainer):
 
     def _training_step(self, batch):
         """Override: use strategy's loss + add distillation loss."""
+        cast_batch_latents(batch, torch.bfloat16)
         apply_connectors(batch, self._embeddings_processor)
 
         model_inputs = self._training_strategy.prepare_training_inputs(
