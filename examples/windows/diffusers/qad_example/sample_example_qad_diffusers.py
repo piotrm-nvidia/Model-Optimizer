@@ -46,6 +46,7 @@ import struct
 import sys
 import warnings
 from collections import Counter
+from dataclasses import fields, replace
 from pathlib import Path
 
 import torch
@@ -57,6 +58,7 @@ from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.model_loader import load_transformer
 from ltx_trainer.timestep_samplers import SAMPLERS
+from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.trainer import LtxvTrainer, TrainingStepOutput
 from ltx_trainer.training_strategies import get_training_strategy
 from torch.utils.data import DataLoader
@@ -252,6 +254,67 @@ def cast_batch_latents(batch: dict, dtype: torch.dtype) -> None:
             value["latents"] = latents.to(dtype=dtype)
 
 
+def cast_modality_compute_tensors(modality, dtype: torch.dtype):
+    """Cast floating-point transformer inputs while preserving position indices."""
+    if modality is None:
+        return None
+
+    updates = {}
+    preserved_fields = {"positions"}
+    for field in fields(modality):
+        if field.name in preserved_fields:
+            continue
+        value = getattr(modality, field.name)
+        if isinstance(value, torch.Tensor) and value.is_floating_point():
+            updates[field.name] = value.to(dtype=dtype)
+    return replace(modality, **updates)
+
+
+def cast_model_inputs(model_inputs, dtype: torch.dtype):
+    """Normalize strategy-produced modality tensors to transformer compute dtype."""
+    model_inputs.video = cast_modality_compute_tensors(model_inputs.video, dtype)
+    model_inputs.audio = cast_modality_compute_tensors(model_inputs.audio, dtype)
+    return model_inputs
+
+
+def describe_model_input_dtypes(model_inputs) -> dict[str, dict[str, str]]:
+    """Return compact modality dtype/device inventory for calibration failures."""
+    inventory = {}
+    for modality_name in ("video", "audio"):
+        modality = getattr(model_inputs, modality_name)
+        if modality is None:
+            continue
+        inventory[modality_name] = {
+            field.name: f"{value.dtype}@{value.device}"
+            for field in fields(modality)
+            if isinstance((value := getattr(modality, field.name)), torch.Tensor)
+        }
+    return inventory
+
+
+def summarize_amax_state(model: torch.nn.Module) -> dict[str, int]:
+    """Summarize calibrated amax tensors without copying model weights."""
+    total = finite = positive = 0
+    for name, value in model.state_dict().items():
+        if "_amax" not in name or not isinstance(value, torch.Tensor):
+            continue
+        total += value.numel()
+        finite += int(torch.isfinite(value).sum().item())
+        positive += int((value.abs() > 0).sum().item())
+    return {"total": total, "finite": finite, "positive": positive}
+
+
+def validate_calibration_counts(attempted: int, successful: int, failed: int) -> None:
+    """Reject empty or majority-failed calibration runs."""
+    if successful == 0:
+        raise RuntimeError(f"Calibration produced zero successful batches out of {attempted}")
+    if failed > attempted * 0.5:
+        raise RuntimeError(
+            f"Too many calibration failures ({failed}/{attempted}); "
+            f"successful batches={successful}"
+        )
+
+
 def apply_connectors(batch, embeddings_processor):
     """Apply the current LTX embeddings processor to precomputed features."""
     conditions = batch["conditions"]
@@ -362,10 +425,15 @@ class LtxvQADTrainer(LtxvTrainer):
         quant_cfg: dict,
         calib_size: int = 512,
         kd_loss_weight: float = 0.5,
+        evaluation_modelopt_state: str | Path | None = None,
     ):
         self._quant_cfg = quant_cfg
         self._calib_size = calib_size
         self._kd_loss_weight = kd_loss_weight
+        self._evaluation_modelopt_state = (
+            Path(evaluation_modelopt_state) if evaluation_modelopt_state else None
+        )
+        self._saved_qad_steps: set[int] = set()
         super().__init__(trainer_config)
 
     # ── Model preparation ─────────────────────────────────────────────────
@@ -376,6 +444,11 @@ class LtxvQADTrainer(LtxvTrainer):
             self._config.optimization.enable_gradient_checkpointing
         )
         self._transformer.to(torch.bfloat16)
+
+        if self._evaluation_modelopt_state is not None:
+            self._restore_ptq_state_for_evaluation()
+            self._transformer = self._accelerator.prepare(self._transformer)
+            return
 
         self._run_calibration()
         self._setup_distillation()
@@ -388,6 +461,47 @@ class LtxvQADTrainer(LtxvTrainer):
         if torch.cuda.is_available():
             vram_gb = torch.cuda.memory_allocated() / 1024**3
             logger.info(f"GPU memory after model preparation: {vram_gb:.2f} GB")
+
+    def _restore_ptq_state_for_evaluation(self) -> None:
+        """Restore calibrated quantizer structure without distillation teacher."""
+        state = torch.load(
+            self._evaluation_modelopt_state,
+            map_location="cpu",
+            weights_only=False,
+        )
+        quantizer_weights = state.pop("modelopt_state_weights", None)
+        if quantizer_weights is None:
+            raise ValueError(
+                f"Missing modelopt_state_weights in {self._evaluation_modelopt_state}"
+            )
+        mto.restore_from_modelopt_state(self._transformer, state)
+        incompatible = self._transformer.load_state_dict(quantizer_weights, strict=False)
+        unexpected = [
+            key
+            for key in incompatible.unexpected_keys
+            if "quantizer" not in key and "_amax" not in key
+        ]
+        if unexpected:
+            raise RuntimeError(f"Unexpected PTQ restore keys: {unexpected[:20]}")
+        amax_summary = summarize_amax_state(self._transformer)
+        if (
+            amax_summary["total"] == 0
+            or amax_summary["finite"] != amax_summary["total"]
+            or amax_summary["positive"] == 0
+        ):
+            raise RuntimeError(f"Invalid restored amax state: {amax_summary}")
+        logger.info(
+            f"Restored PTQ-only state from {self._evaluation_modelopt_state}: "
+            f"amax={amax_summary}"
+        )
+
+    def evaluate(self, step: int) -> list[Path]:
+        """Run configured validation samples without optimizer updates."""
+        self._global_step = step
+        self._transformer.eval()
+        progress = TrainingProgress(enabled=is_global_rank0(), total_steps=1)
+        with progress:
+            return self._run_validation(progress)
 
     # ── Calibration ───────────────────────────────────────────────────────
 
@@ -427,6 +541,8 @@ class LtxvQADTrainer(LtxvTrainer):
             model.eval()
             data_iter = iter(calib_loader)
             failures = 0
+            successes = 0
+            dtype_inventory = {}
             with torch.no_grad():
                 for i in range(calib_steps):
                     try:
@@ -443,11 +559,14 @@ class LtxvQADTrainer(LtxvTrainer):
                             apply_connectors(batch, embeddings_processor)
 
                         model_inputs = strategy.prepare_training_inputs(batch, timestep_sampler)
+                        model_inputs = cast_model_inputs(model_inputs, torch.bfloat16)
+                        dtype_inventory = describe_model_input_dtypes(model_inputs)
                         model(
                             video=model_inputs.video,
                             audio=model_inputs.audio,
                             perturbations=None,
                         )
+                        successes += 1
 
                     except Exception as e:
                         failures += 1
@@ -455,29 +574,83 @@ class LtxvQADTrainer(LtxvTrainer):
                             import traceback
 
                             logger.warning(
-                                f"Calibration batch {i} failed:\n{traceback.format_exc()}"
+                                f"Calibration batch {i} failed with inputs "
+                                f"{json.dumps(dtype_inventory, sort_keys=True)}:\n"
+                                f"{traceback.format_exc()}"
                             )
                         elif failures <= 5:
                             logger.warning(f"Calibration batch {i} failed: {e}")
                         if failures > calib_steps * 0.5:
-                            logger.error(
-                                f"Too many calibration failures ({failures}/{i + 1}), aborting"
+                            raise RuntimeError(
+                                f"Too many calibration failures ({failures}/{i + 1}); "
+                                f"successful batches={successes}"
                             )
-                            return
                         continue
 
-                    if (i + 1) % 50 == 0 or (i + 1) == calib_steps:
-                        logger.info(f"Calibrated {i + 1}/{calib_steps} batches")
+                    if successes % 50 == 0 or (i + 1) == calib_steps:
+                        logger.info(
+                            f"Calibrated {successes}/{calib_steps} batches "
+                            f"({failures} failures)"
+                        )
 
-            if failures > 0:
+            validate_calibration_counts(calib_steps, successes, failures)
+            if failures:
                 logger.warning(
-                    f"Calibration completed with {failures}/{calib_steps} failed batches"
+                    f"Calibration completed with {successes}/{calib_steps} successful "
+                    f"batches and {failures} failures"
                 )
 
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            report_path = (
+                Path(self._config.output_dir)
+                / "calibration"
+                / f"calibration_rank_{rank:02d}.json"
+            )
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(
+                json.dumps(
+                    {
+                        "rank": rank,
+                        "attempted": calib_steps,
+                        "successful": successes,
+                        "failed": failures,
+                        "input_dtypes": dtype_inventory,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            )
+
         mtq.quantize(self._transformer, self._quant_cfg, calibration_forward_loop)
-        logger.info("PTQ calibration complete")
+        amax_summary = summarize_amax_state(self._transformer)
+        if (
+            amax_summary["total"] == 0
+            or amax_summary["finite"] != amax_summary["total"]
+            or amax_summary["positive"] == 0
+        ):
+            raise RuntimeError(f"Invalid calibrated amax state: {amax_summary}")
+        logger.info(f"PTQ calibration complete: amax={amax_summary}")
+        self._save_ptq_state()
         if is_global_rank0():
             mtq.print_quant_summary(self._transformer)
+
+    def _save_ptq_state(self) -> None:
+        """Save restorable step-0 quantizer structure and calibrated state."""
+        if not is_global_rank0():
+            return
+
+        from modelopt.torch.quantization.utils import get_quantizer_state_dict
+
+        save_dir = Path(self._config.output_dir) / "checkpoints"
+        save_dir.mkdir(exist_ok=True, parents=True)
+        state = mto.modelopt_state(self._transformer)
+        state["modelopt_state_weights"] = get_quantizer_state_dict(self._transformer)
+        output_path = save_dir / "modelopt_state_step_00000.pth"
+        tmp_path = output_path.with_suffix(".pth.tmp")
+        torch.save(state, tmp_path)
+        tmp_path.rename(output_path)
+        logger.info(f"Saved PTQ-only ModelOpt state to {output_path}")
 
     # ── Distillation setup ────────────────────────────────────────────────
 
@@ -513,6 +686,7 @@ class LtxvQADTrainer(LtxvTrainer):
         model_inputs = self._training_strategy.prepare_training_inputs(
             batch, self._timestep_sampler
         )
+        model_inputs = cast_model_inputs(model_inputs, torch.bfloat16)
 
         video_pred, audio_pred = self._transformer(
             video=model_inputs.video,
@@ -545,15 +719,19 @@ class LtxvQADTrainer(LtxvTrainer):
         """
         from safetensors.torch import save_file
 
-        self._accelerator.wait_for_everyone()
         save_dir = Path(self._config.output_dir) / "checkpoints"
+        prefix = "model" if self._config.model.training_mode == "full" else "lora"
+        saved_weights_path = (
+            save_dir / f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
+        )
+        if self._global_step in self._saved_qad_steps:
+            logger.info(f"Checkpoint step {self._global_step} already saved; reusing it")
+            return saved_weights_path
+
+        self._accelerator.wait_for_everyone()
 
         # FSDP collective — all ranks must call this
         state_dict = self._accelerator.get_state_dict(self._transformer)
-
-        prefix = "model" if self._config.model.training_mode == "full" else "lora"
-        filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
-        saved_weights_path = save_dir / filename
 
         if is_global_rank0() and state_dict is not None:
             save_dir.mkdir(exist_ok=True, parents=True)
@@ -640,8 +818,10 @@ class LtxvQADTrainer(LtxvTrainer):
                 logger.warning(f"Failed to save modelopt state: {e}")
 
         self._accelerator.wait_for_everyone()
-        self._checkpoint_paths.append(saved_weights_path)
-        self._cleanup_checkpoints()
+        self._saved_qad_steps.add(self._global_step)
+        if saved_weights_path not in self._checkpoint_paths:
+            self._checkpoint_paths.append(saved_weights_path)
+        self._save_training_state(save_dir)
         return saved_weights_path
 
 
@@ -911,6 +1091,23 @@ def parse_args():
         help="Output path for inference .safetensors",
     )
 
+    # ── Evaluate quantized checkpoint command ──
+    eval_parser = subparsers.add_parser(
+        "evaluate",
+        help="Evaluate PTQ-only or trained student weights with saved ModelOpt state",
+    )
+    eval_parser.add_argument("--config", type=str, required=True)
+    eval_parser.add_argument("--modelopt-state", type=str, required=True)
+    eval_parser.add_argument("--step", type=int, required=True)
+    eval_parser.add_argument("--calib-size", type=int, default=512)
+    eval_parser.add_argument("--kd-loss-weight", type=float, default=0.5)
+    eval_parser.add_argument(
+        "--exclude-blocks",
+        type=int,
+        nargs="*",
+        default=[0, 1, 46, 47],
+    )
+
     # Backward compatibility: if no subcommand, treat as train
     args, remaining = parser.parse_known_args()
     if args.command is None:
@@ -980,7 +1177,9 @@ def main():
         if args.exclude_blocks != [0, 1, 46, 47]
         else qad_config.get("exclude_blocks", [0, 1, 46, 47])
     )
-    skip_inference_ckpt = args.skip_inference_ckpt or qad_config.get("skip_inference_ckpt", False)
+    skip_inference_ckpt = getattr(args, "skip_inference_ckpt", False) or qad_config.get(
+        "skip_inference_ckpt", False
+    )
 
     quant_cfg = build_quant_config(exclude_blocks=exclude_blocks)
 
@@ -1000,7 +1199,15 @@ def main():
         quant_cfg=quant_cfg,
         calib_size=calib_size,
         kd_loss_weight=kd_loss_weight,
+        evaluation_modelopt_state=(
+            args.modelopt_state if args.command == "evaluate" else None
+        ),
     )
+
+    if args.command == "evaluate":
+        paths = trainer.evaluate(step=args.step)
+        logger.info(f"Evaluation complete: {len(paths)} samples on rank")
+        return
 
     saved_path, stats = trainer.train()
 
