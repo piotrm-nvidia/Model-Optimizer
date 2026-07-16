@@ -498,6 +498,12 @@ class LtxvQADTrainer(LtxvTrainer):
 
     def evaluate(self, step: int) -> list[Path]:
         """Run configured validation samples without optimizer updates."""
+        class _EvaluationOptimizer:
+            @staticmethod
+            def zero_grad(set_to_none: bool = True) -> None:
+                del set_to_none
+
+        self._optimizer = _EvaluationOptimizer()
         self._global_step = step
         self._transformer.eval()
         progress = TrainingProgress(enabled=is_global_rank0(), total_steps=1)
