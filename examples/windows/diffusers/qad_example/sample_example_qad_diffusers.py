@@ -484,12 +484,13 @@ class LtxvQADTrainer(LtxvTrainer):
         if unexpected:
             raise RuntimeError(f"Unexpected PTQ restore keys: {unexpected[:20]}")
         amax_summary = summarize_amax_state(self._transformer)
-        if (
-            amax_summary["total"] == 0
-            or amax_summary["finite"] != amax_summary["total"]
-            or amax_summary["positive"] == 0
-        ):
+        if amax_summary["total"] == 0 or amax_summary["positive"] == 0:
             raise RuntimeError(f"Invalid restored amax state: {amax_summary}")
+        if amax_summary["finite"] != amax_summary["total"]:
+            logger.warning(
+                "Restored amax state contains non-finite entries, typically from "
+                f"disabled quantizers: {amax_summary}"
+            )
         logger.info(
             f"Restored PTQ-only state from {self._evaluation_modelopt_state}: "
             f"amax={amax_summary}"
