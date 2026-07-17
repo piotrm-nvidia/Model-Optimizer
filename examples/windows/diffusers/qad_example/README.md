@@ -70,6 +70,7 @@ pip install torch accelerate safetensors pyyaml
 | File | Description |
 |------|-------------|
 | `sample_example_qad_diffusers.py` | Main script: QAD training and inference checkpoint creation |
+| `modelopt_ltx/` | Isolated LTX workflow CLI for PTQ state, QAD resume, deploy bundles, parity, and validation |
 | `ltx2_qad.yaml` | LTX training config (model, data, optimization, QAD options) |
 | `fsdp_custom.yaml` | Accelerate FSDP config for multi-GPU training |
 
@@ -134,6 +135,35 @@ Using Accelerate with the provided FSDP config:
 accelerate launch --config_file fsdp_custom.yaml sample_example_qad_diffusers.py train \
     --config ltx2_qad.yaml \
 ```
+
+Historical invocations remain NVFP4. FP8 is opt-in:
+
+```bash
+accelerate launch --config_file fsdp_custom.yaml sample_example_qad_diffusers.py train \
+    --config ltx2_qad.yaml \
+    --quant-recipe fp8
+```
+
+For a fail-closed PTQ → QAD workflow, put this example directory on
+`PYTHONPATH`, then use:
+
+```bash
+python -m modelopt_ltx.cli ptq \
+    --quant-recipe fp8 --config ltx2_qad.yaml \
+    --calibration-manifest train.json --output outputs/ptq_step0
+
+torchrun --standalone --nproc-per-node=8 -m modelopt_ltx.cli qad \
+    --quant-recipe fp8 --config ltx2_qad.yaml \
+    --init outputs/ptq_step0 --output outputs/qad
+
+python -m modelopt_ltx.cli create-fp8-deploy \
+    --checkpoint outputs/qad/checkpoints/model_weights_step_00010.safetensors \
+    --config ltx2_qad.yaml --output outputs/deploy/step10
+```
+
+`--init` restores saved ModelOpt architecture and quantizer tensors, so QAD
+does not recalibrate. Deploy bundles use independent file copies and SHA-256
+manifests; no hardlinks are created.
 
 Checkpoints are saved under `output_dir` (e.g. `outputs/ltx2_qad/checkpoints/`) as safetensors plus optional amax and modelopt state files.
 
