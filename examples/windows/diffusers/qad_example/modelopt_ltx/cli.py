@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     step0_parser.add_argument("--config", type=Path, required=True)
     step0_parser.add_argument("--manifest", type=Path, required=True)
     step0_parser.add_argument("--seeds", nargs="+", type=int, required=True)
+    step0_parser.add_argument("--backend", choices=("native", "fake"), default="native")
     step0_parser.add_argument("--output", type=Path, required=True)
 
     qad_parser = commands.add_parser("qad")
@@ -76,6 +77,7 @@ def main() -> None:
             config_path=args.config,
             manifest_path=args.manifest,
             output=args.output,
+            backend=args.backend,
         )
     elif args.command == "ptq":
         if not args.calibration_manifest.is_file():

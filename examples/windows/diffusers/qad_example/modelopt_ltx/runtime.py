@@ -322,6 +322,7 @@ def evaluate_bundle(
     config_path: Path,
     manifest_path: Path,
     output: Path,
+    backend: str = "native",
 ) -> None:
     import torch
     from ltx_trainer.progress import TrainingProgress
@@ -340,7 +341,12 @@ def evaluate_bundle(
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    transformer, deploy = _load_native_transformer(bundle, device)
+    if backend == "native":
+        transformer, deploy = _load_native_transformer(bundle, device)
+    elif backend == "fake":
+        transformer, deploy = _load_fake_transformer(bundle, device)
+    else:
+        raise ValueError(f"Unknown evaluation backend: {backend}")
     output.mkdir(parents=True, exist_ok=True)
     scaled_mm_calls = 0
     original_scaled_mm = torch._scaled_mm
@@ -362,14 +368,19 @@ def evaluate_bundle(
             )
     finally:
         torch._scaled_mm = original_scaled_mm
-    if scaled_mm_calls < 1:
+    if backend == "native" and scaled_mm_calls < 1:
         raise RuntimeError("Native FP8 inference executed no torch._scaled_mm calls")
     atomic_json(
-        output / "native_kernel_evidence.json",
+        output
+        / (
+            "native_kernel_evidence.json"
+            if backend == "native"
+            else "fake_quant_execution_evidence.json"
+        ),
         {
-            "backend": "ltx fp8-scaled-mm",
+            "backend": "ltx fp8-scaled-mm" if backend == "native" else "ModelOpt fake FP8",
             "torch_scaled_mm_calls": scaled_mm_calls,
-            "negative_control": "pending dedicated performance stage",
+            "negative_control": backend == "fake",
         },
     )
     rows = json.loads(manifest_path.read_text())
