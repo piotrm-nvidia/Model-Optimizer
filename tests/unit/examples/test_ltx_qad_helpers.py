@@ -16,6 +16,7 @@ from modelopt.torch.quantization.utils import (
 from examples.windows.diffusers.qad_example.sample_example_qad_diffusers import (
     audit_quantizer_coverage,
     audit_quantizer_state_keys,
+    calibration_step_count,
     cast_model_inputs,
     compare_tensor_outputs,
     inventory_digest,
@@ -104,6 +105,18 @@ def test_validate_calibration_counts_rejects_bad_runs(
 ):
     with pytest.raises(RuntimeError, match=match):
         validate_calibration_counts(attempted, successful, failed)
+
+
+def test_calibration_step_count_cycles_smaller_representative_dataset():
+    assert calibration_step_count(requested=32, dataset_size=8) == 32
+    assert calibration_step_count(requested=32, dataset_size=16) == 32
+
+
+def test_calibration_step_count_rejects_empty_or_nonpositive_requests():
+    with pytest.raises(RuntimeError, match="dataset is empty"):
+        calibration_step_count(requested=32, dataset_size=0)
+    with pytest.raises(ValueError, match="must be positive"):
+        calibration_step_count(requested=0, dataset_size=8)
 
 
 def test_summarize_amax_state_counts_finite_positive_values():

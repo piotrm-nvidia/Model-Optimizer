@@ -568,6 +568,15 @@ def validate_calibration_counts(attempted: int, successful: int, failed: int) ->
         )
 
 
+def calibration_step_count(requested: int, dataset_size: int) -> int:
+    """Return requested observations while requiring usable calibration data."""
+    if requested <= 0:
+        raise ValueError(f"Calibration size must be positive, got {requested}")
+    if dataset_size <= 0:
+        raise RuntimeError("Calibration dataset is empty")
+    return requested
+
+
 def apply_connectors(batch, embeddings_processor):
     """Apply the current LTX embeddings processor to precomputed features."""
     conditions = batch["conditions"]
@@ -962,7 +971,11 @@ class LtxvQADTrainer(LtxvTrainer):
         sampler_cls = SAMPLERS[self._config.flow_matching.timestep_sampling_mode]
         timestep_sampler = sampler_cls(**self._config.flow_matching.timestep_sampling_params)
 
-        calib_steps = min(self._calib_size, len(dataset))
+        # Honor the requested number of activation observations even when the
+        # representative dataset has fewer unique clips. The loop below
+        # intentionally restarts the deterministic loader and samples a new
+        # timestep for each pass.
+        calib_steps = calibration_step_count(self._calib_size, len(dataset))
         strategy = self._training_strategy
         device = self._accelerator.device
         embeddings_processor = self._embeddings_processor
