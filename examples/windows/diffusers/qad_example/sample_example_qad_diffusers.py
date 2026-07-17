@@ -423,6 +423,13 @@ def audit_quantizer_coverage(
         if actual_by_name[name]["amax"]["present"]
         and not actual_by_name[name]["amax"]["finite"]
     )
+    mismatched_enabled_amax = sorted(
+        name
+        for name in expected_enabled & actual_enabled
+        if expected_by_name[name].get("requires_amax", True)
+        and expected_by_name[name]["amax"]["digest"]
+        != actual_by_name[name]["amax"]["digest"]
+    )
     disabled_nonfinite = sorted(
         name
         for name, item in actual_by_name.items()
@@ -436,6 +443,7 @@ def audit_quantizer_coverage(
         "missing_keys": missing_keys,
         "unexpected_keys": unexpected_keys,
         "missing_enabled_amax": missing_enabled_amax,
+        "mismatched_enabled_amax": mismatched_enabled_amax,
         "enabled_nonfinite": enabled_nonfinite,
         "disabled_nonfinite": disabled_nonfinite,
     }
@@ -743,22 +751,18 @@ class LtxvQADTrainer(LtxvTrainer):
             )
         mto.restore_from_modelopt_state(self._transformer, state)
         restored_structure_inventory = quantizer_inventory(self._transformer)
-        incompatible = self._transformer.load_state_dict(quantizer_weights, strict=False)
-        unexpected = [
-            key
-            for key in incompatible.unexpected_keys
-            if "quantizer" not in key and "_amax" not in key
-        ]
-        if unexpected:
-            raise RuntimeError(f"Unexpected PTQ restore keys: {unexpected[:20]}")
         if expected_state_keys is None:
             expected_state_keys = sorted(quantizer_weights)
             logger.warning(
                 "Legacy ModelOpt state has no quantizer_state_keys; "
                 "using serialized quantizer weight keys as restore baseline"
             )
-        from modelopt.torch.quantization.utils import get_quantizer_state_dict
+        from modelopt.torch.quantization.utils import (
+            get_quantizer_state_dict,
+            set_quantizer_state_dict,
+        )
 
+        set_quantizer_state_dict(self._transformer, quantizer_weights)
         restored_quantizer_weights = get_quantizer_state_dict(self._transformer)
         audit_quantizer_state_keys(expected_state_keys, restored_quantizer_weights)
         actual_inventory = self._write_quantizer_inventory("restored")

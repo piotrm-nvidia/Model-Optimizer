@@ -8,6 +8,10 @@ import pytest
 import torch
 from modelopt.torch.quantization.config import QuantizerAttributeConfig
 from modelopt.torch.quantization.nn import TensorQuantizer
+from modelopt.torch.quantization.utils import (
+    get_quantizer_state_dict,
+    set_quantizer_state_dict,
+)
 
 from examples.windows.diffusers.qad_example.sample_example_qad_diffusers import (
     audit_quantizer_coverage,
@@ -174,6 +178,31 @@ def test_coverage_audit_rejects_required_enabled_amax_absence():
 
     with pytest.raises(RuntimeError, match="missing_enabled_amax"):
         audit_quantizer_coverage(expected, actual)
+
+
+def test_coverage_audit_rejects_changed_calibrated_amax():
+    expected = quantizer_inventory(_QuantizerModel())
+    actual_model = _QuantizerModel()
+    actual_model.enabled_input_quantizer.amax = torch.tensor(9.0)
+    actual = quantizer_inventory(actual_model)
+
+    with pytest.raises(RuntimeError, match="mismatched_enabled_amax"):
+        audit_quantizer_coverage(expected, actual)
+
+
+def test_nested_quantizer_state_round_trip_restores_amax_exactly():
+    source = _QuantizerModel()
+    target = _QuantizerModel()
+    target.enabled_input_quantizer.amax = torch.tensor(9.0)
+    state = get_quantizer_state_dict(source)
+
+    set_quantizer_state_dict(target, state)
+
+    audit_quantizer_coverage(
+        quantizer_inventory(source),
+        quantizer_inventory(target),
+    )
+    assert target.enabled_input_quantizer.amax.item() == 2.0
 
 
 def test_coverage_audit_rejects_missing_and_unexpected_quantizers():
