@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import importlib.util
 import json
 import os
@@ -328,7 +329,7 @@ def evaluate_bundle(
 
     payload, _ = load_config(config_path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    transformer, deploy = _load_native_transformer(bundle, device)
+    deploy = verify_deploy_bundle(bundle)
     config = _validation_config(payload, manifest_path)
     runner = ValidationRunner(
         config=config,
@@ -336,6 +337,10 @@ def evaluate_bundle(
         text_encoder_path=payload["model"]["text_encoder_path"],
         load_text_encoder_in_8bit=False,
     )
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    transformer, deploy = _load_native_transformer(bundle, device)
     output.mkdir(parents=True, exist_ok=True)
     scaled_mm_calls = 0
     original_scaled_mm = torch._scaled_mm
