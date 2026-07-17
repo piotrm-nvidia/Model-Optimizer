@@ -414,6 +414,7 @@ class LtxvQADTrainer(LtxvTrainer):
         self._initial_modelopt_state = initial_modelopt_state
         self._setup_distillation_enabled = setup_distillation
         self._qad_checkpoint_steps = set(checkpoint_steps or [])
+        self._saved_qad_steps: set[int] = set()
         super().__init__(trainer_config)
 
     # ── Model preparation ─────────────────────────────────────────────────
@@ -705,12 +706,16 @@ class LtxvQADTrainer(LtxvTrainer):
         """
         from safetensors.torch import save_file
 
+        prefix = "model" if self._config.model.training_mode == "full" else "lora"
+        saved_weights_path = (
+            Path(self._config.output_dir)
+            / "checkpoints"
+            / f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
+        )
+        if self._global_step in self._saved_qad_steps:
+            return saved_weights_path
         if not should_save_checkpoint(self._global_step, self._qad_checkpoint_steps):
-            return (
-                Path(self._config.output_dir)
-                / "checkpoints"
-                / f"model_weights_step_{self._global_step:05d}.safetensors"
-            )
+            return saved_weights_path
 
         self._accelerator.wait_for_everyone()
         save_dir = Path(self._config.output_dir) / "checkpoints"
@@ -741,10 +746,6 @@ class LtxvQADTrainer(LtxvTrainer):
 
         # FSDP collective — all ranks must call this
         state_dict = self._accelerator.get_state_dict(self._transformer)
-
-        prefix = "model" if self._config.model.training_mode == "full" else "lora"
-        filename = f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
-        saved_weights_path = save_dir / filename
 
         if is_global_rank0() and state_dict is not None:
             save_dir.mkdir(exist_ok=True, parents=True)
@@ -834,6 +835,7 @@ class LtxvQADTrainer(LtxvTrainer):
         if is_global_rank0():
             self._checkpoint_paths.append(saved_weights_path)
             self._cleanup_checkpoints()
+        self._saved_qad_steps.add(self._global_step)
         self._accelerator.wait_for_everyone()
         return saved_weights_path
 
