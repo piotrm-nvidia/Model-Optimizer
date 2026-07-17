@@ -712,6 +712,10 @@ class LtxvQADTrainer(LtxvTrainer):
 
         if self._evaluation_modelopt_state is not None:
             self._restore_ptq_state_for_evaluation()
+            # Fresh restore leaves base weights and quantizer buffers on CPU.
+            # The deterministic pre-FSDP probe uses CUDA inputs, so move the
+            # complete restored transformer before capturing that forward.
+            self._transformer.to(self._accelerator.device)
             self._prepare_fixed_parity_probe()
             self._capture_pre_prepare_probe()
             self._transformer = self._accelerator.prepare(self._transformer)
