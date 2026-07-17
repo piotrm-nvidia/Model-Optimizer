@@ -831,8 +831,10 @@ class LtxvQADTrainer(LtxvTrainer):
             logger.info(f"Saved modelopt state to {modelopt_path}")
 
         self._accelerator.wait_for_everyone()
-        self._checkpoint_paths.append(saved_weights_path)
-        self._cleanup_checkpoints()
+        if is_global_rank0():
+            self._checkpoint_paths.append(saved_weights_path)
+            self._cleanup_checkpoints()
+        self._accelerator.wait_for_everyone()
         return saved_weights_path
 
 
