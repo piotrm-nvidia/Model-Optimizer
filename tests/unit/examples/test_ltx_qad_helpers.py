@@ -139,6 +139,21 @@ def test_coverage_audit_classifies_disabled_nonfinite_without_failure():
     assert report["disabled_nonfinite"] == ["disabled_input_quantizer"]
 
 
+def test_coverage_audit_allows_uncalibrated_runtime_dynamic_input():
+    model = _QuantizerModel()
+    model.enabled_input_quantizer.reset_amax()
+    inventory = quantizer_inventory(model)
+
+    report = audit_quantizer_coverage(inventory, inventory)
+
+    dynamic = next(
+        item for item in inventory if item["fqn"] == "enabled_input_quantizer"
+    )
+    assert dynamic["enabled"] is True
+    assert dynamic["requires_amax"] is False
+    assert report["missing_enabled_amax"] == []
+
+
 def test_coverage_audit_rejects_enabled_set_and_amax_failures():
     expected = quantizer_inventory(_QuantizerModel())
     actual = quantizer_inventory(_QuantizerModel())

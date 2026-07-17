@@ -359,9 +359,11 @@ def quantizer_inventory(model: torch.nn.Module) -> list[dict]:
             "class": f"{type(module).__module__}.{type(module).__qualname__}",
             "enabled": enabled,
             "disabled": not enabled,
-            # NVFP4 can use runtime-computed dynamic block scales. Such quantizers
-            # intentionally have no persistent _amax and must not fail coverage.
-            "requires_amax": enabled and not bool(getattr(module, "_dynamic", False)),
+            # Enabled input quantizers not exercised by the target modality can
+            # legitimately remain runtime-dynamic. Calibrated input quantizers
+            # and all enabled weight quantizers must retain their saved _amax.
+            "requires_amax": enabled
+            and ("weight_quantizer" in name or isinstance(amax, torch.Tensor)),
             "config": {
                 attr: _json_value(getattr(module, attr))
                 for attr in attribute_names
@@ -407,10 +409,13 @@ def audit_quantizer_coverage(
     unexpected_keys = sorted(set(actual_by_name) - set(expected_by_name))
     missing_enabled_amax = sorted(
         name
-        for name in actual_enabled
+        for name in expected_enabled
         if require_enabled_amax
-        and actual_by_name[name].get("requires_amax", True)
-        and not actual_by_name[name]["amax"]["present"]
+        and expected_by_name[name].get("requires_amax", True)
+        and (
+            name not in actual_by_name
+            or not actual_by_name[name]["amax"]["present"]
+        )
     )
     enabled_nonfinite = sorted(
         name
