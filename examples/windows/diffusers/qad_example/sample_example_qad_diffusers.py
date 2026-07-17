@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import logging
 import os
@@ -69,6 +70,7 @@ import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 from modelopt.torch.distill.distillation_model import DistillationModel
 from modelopt.torch.quantization.config import NVFP4_DEFAULT_CFG
+from modelopt.torch.quantization.nn import TensorQuantizer
 from modelopt.torch.utils import safe_load
 
 warnings.warn(
@@ -304,6 +306,244 @@ def summarize_amax_state(model: torch.nn.Module) -> dict[str, int]:
     return {"total": total, "finite": finite, "positive": positive}
 
 
+def tensor_digest(value: torch.Tensor) -> str:
+    """Return a device- and stride-independent SHA-256 tensor digest."""
+    tensor = value.detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tensor.dtype).encode())
+    digest.update(json.dumps(list(tensor.shape)).encode())
+    digest.update(tensor.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _json_value(value):
+    """Convert small quantizer attributes to stable JSON values."""
+    if isinstance(value, torch.Tensor):
+        return {
+            "shape": list(value.shape),
+            "dtype": str(value.dtype),
+            "digest": tensor_digest(value),
+        }
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, tuple):
+        return [_json_value(item) for item in value]
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_value(item) for key, item in sorted(value.items(), key=str)}
+    return repr(value)
+
+
+def quantizer_inventory(model: torch.nn.Module) -> list[dict]:
+    """Inventory only ModelOpt TensorQuantizer modules in stable FQN order."""
+    inventory = []
+    attribute_names = (
+        "num_bits",
+        "axis",
+        "unsigned",
+        "block_sizes",
+        "_dynamic",
+        "_if_quant",
+        "_if_calib",
+        "_fake_quant",
+        "_use_constant_amax",
+    )
+    for name, module in model.named_modules():
+        if not isinstance(module, TensorQuantizer):
+            continue
+        enabled = bool(module.is_enabled)
+        amax = getattr(module, "_amax", None)
+        item = {
+            "fqn": name,
+            "class": f"{type(module).__module__}.{type(module).__qualname__}",
+            "enabled": enabled,
+            "disabled": not enabled,
+            # NVFP4 can use runtime-computed dynamic block scales. Such quantizers
+            # intentionally have no persistent _amax and must not fail coverage.
+            "requires_amax": enabled and not bool(getattr(module, "_dynamic", False)),
+            "config": {
+                attr: _json_value(getattr(module, attr))
+                for attr in attribute_names
+                if hasattr(module, attr)
+            },
+            "amax": {
+                "present": isinstance(amax, torch.Tensor),
+                "shape": list(amax.shape) if isinstance(amax, torch.Tensor) else None,
+                "dtype": str(amax.dtype) if isinstance(amax, torch.Tensor) else None,
+                "finite": bool(torch.isfinite(amax).all().item())
+                if isinstance(amax, torch.Tensor)
+                else None,
+                "positive": bool((amax.abs() > 0).all().item())
+                if isinstance(amax, torch.Tensor)
+                else None,
+                "digest": tensor_digest(amax) if isinstance(amax, torch.Tensor) else None,
+            },
+        }
+        inventory.append(item)
+    return sorted(inventory, key=lambda item: item["fqn"])
+
+
+def inventory_digest(inventory: list[dict]) -> str:
+    """Digest a quantizer inventory using canonical JSON."""
+    payload = json.dumps(inventory, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def audit_quantizer_coverage(
+    expected: list[dict],
+    actual: list[dict],
+    *,
+    require_enabled_amax: bool = True,
+) -> dict:
+    """Audit exact enabled coverage and classify non-finite disabled quantizers."""
+    expected_by_name = {item["fqn"]: item for item in expected}
+    actual_by_name = {item["fqn"]: item for item in actual}
+    expected_enabled = {
+        name for name, item in expected_by_name.items() if item["enabled"]
+    }
+    actual_enabled = {name for name, item in actual_by_name.items() if item["enabled"]}
+    missing_keys = sorted(set(expected_by_name) - set(actual_by_name))
+    unexpected_keys = sorted(set(actual_by_name) - set(expected_by_name))
+    missing_enabled_amax = sorted(
+        name
+        for name in actual_enabled
+        if require_enabled_amax
+        and actual_by_name[name].get("requires_amax", True)
+        and not actual_by_name[name]["amax"]["present"]
+    )
+    enabled_nonfinite = sorted(
+        name
+        for name in actual_enabled
+        if actual_by_name[name]["amax"]["present"]
+        and not actual_by_name[name]["amax"]["finite"]
+    )
+    disabled_nonfinite = sorted(
+        name
+        for name, item in actual_by_name.items()
+        if item["disabled"] and item["amax"]["present"] and not item["amax"]["finite"]
+    )
+    report = {
+        "expected_enabled_names": sorted(expected_enabled),
+        "actual_enabled_names": sorted(actual_enabled),
+        "missing_enabled_names": sorted(expected_enabled - actual_enabled),
+        "unexpected_enabled_names": sorted(actual_enabled - expected_enabled),
+        "missing_keys": missing_keys,
+        "unexpected_keys": unexpected_keys,
+        "missing_enabled_amax": missing_enabled_amax,
+        "enabled_nonfinite": enabled_nonfinite,
+        "disabled_nonfinite": disabled_nonfinite,
+    }
+    hard_failures = {
+        key: value
+        for key, value in report.items()
+        if key != "disabled_nonfinite"
+        and key not in {"expected_enabled_names", "actual_enabled_names"}
+        and value
+    }
+    if hard_failures:
+        raise RuntimeError(f"Quantizer coverage audit failed: {hard_failures}")
+    return report
+
+
+def audit_quantizer_state_keys(expected_keys, actual_keys) -> dict[str, list[str]]:
+    """Require exact quantizer state-dict key coverage."""
+    expected = set(expected_keys)
+    actual = set(actual_keys)
+    report = {
+        "missing_keys": sorted(expected - actual),
+        "unexpected_keys": sorted(actual - expected),
+    }
+    if report["missing_keys"] or report["unexpected_keys"]:
+        raise RuntimeError(f"Quantizer state key audit failed: {report}")
+    return report
+
+
+def reset_runtime_dynamic_input_amax(model: torch.nn.Module) -> list[str]:
+    """Reset fixed activation amax only on enabled input quantizers.
+
+    This controls runtime-dynamic activation ranges. It does not alter NVFP4
+    ``block_sizes['type'] == 'dynamic'`` block-scale configuration.
+    """
+    reset = []
+    for name, module in model.named_modules():
+        if (
+            isinstance(module, TensorQuantizer)
+            and name.endswith("input_quantizer")
+            and module.is_enabled
+            and hasattr(module, "_amax")
+        ):
+            module.reset_amax()
+            reset.append(name)
+    return sorted(reset)
+
+
+def _named_tensors(value, prefix: str = "output"):
+    if isinstance(value, torch.Tensor):
+        yield prefix, value
+    elif isinstance(value, (tuple, list)):
+        for index, item in enumerate(value):
+            yield from _named_tensors(item, f"{prefix}.{index}")
+    elif isinstance(value, dict):
+        for name in sorted(value):
+            yield from _named_tensors(value[name], f"{prefix}.{name}")
+
+
+def tensor_output_report(value) -> dict:
+    """Return numeric summaries and exact digests for nested tensor outputs."""
+    report = {}
+    for name, tensor in _named_tensors(value):
+        floating = tensor.detach().float()
+        report[name] = {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "digest": tensor_digest(tensor),
+            "finite": bool(torch.isfinite(floating).all().item()),
+            "min": float(floating.min().item()) if floating.numel() else None,
+            "max": float(floating.max().item()) if floating.numel() else None,
+            "mean": float(floating.mean().item()) if floating.numel() else None,
+        }
+    return report
+
+
+def compare_tensor_outputs(
+    reference, actual, *, atol: float = 1e-5, rtol: float = 1e-5
+) -> dict:
+    """Compare nested tensor outputs with exact digest and numeric tolerances."""
+    reference_tensors = dict(_named_tensors(reference))
+    actual_tensors = dict(_named_tensors(actual))
+    missing = sorted(set(reference_tensors) - set(actual_tensors))
+    unexpected = sorted(set(actual_tensors) - set(reference_tensors))
+    tensors = {}
+    for name in sorted(set(reference_tensors) & set(actual_tensors)):
+        ref = reference_tensors[name].detach().float().cpu()
+        got = actual_tensors[name].detach().float().cpu()
+        same_shape = ref.shape == got.shape
+        difference = (ref - got).abs() if same_shape else None
+        tensors[name] = {
+            "same_shape": same_shape,
+            "exact_digest": tensor_digest(reference_tensors[name])
+            == tensor_digest(actual_tensors[name]),
+            "allclose": bool(torch.allclose(ref, got, atol=atol, rtol=rtol))
+            if same_shape
+            else False,
+            "max_abs_diff": float(difference.max().item())
+            if difference is not None and difference.numel()
+            else None,
+            "mean_abs_diff": float(difference.mean().item())
+            if difference is not None and difference.numel()
+            else None,
+        }
+    return {
+        "missing": missing,
+        "unexpected": unexpected,
+        "allclose": not missing
+        and not unexpected
+        and all(item["allclose"] for item in tensors.values()),
+        "tensors": tensors,
+    }
+
+
 def validate_calibration_counts(attempted: int, successful: int, failed: int) -> None:
     """Reject empty or majority-failed calibration runs."""
     if successful == 0:
@@ -426,6 +666,10 @@ class LtxvQADTrainer(LtxvTrainer):
         calib_size: int = 512,
         kd_loss_weight: float = 0.5,
         evaluation_modelopt_state: str | Path | None = None,
+        ptq_only: bool = False,
+        probe_output: str | Path | None = None,
+        probe_seed: int = 42,
+        runtime_dynamic_activations: bool = False,
     ):
         self._quant_cfg = quant_cfg
         self._calib_size = calib_size
@@ -433,6 +677,14 @@ class LtxvQADTrainer(LtxvTrainer):
         self._evaluation_modelopt_state = (
             Path(evaluation_modelopt_state) if evaluation_modelopt_state else None
         )
+        self._ptq_only = ptq_only
+        self._probe_output = Path(probe_output) if probe_output else None
+        self._probe_seed = probe_seed
+        self._runtime_dynamic_activations = runtime_dynamic_activations
+        self._fixed_probe_inputs = None
+        self._pre_prepare_probe_output = None
+        self._probe_metadata = {}
+        self._runtime_dynamic_reset_names: list[str] = []
         self._saved_qad_steps: set[int] = set()
         super().__init__(trainer_config)
 
@@ -447,13 +699,20 @@ class LtxvQADTrainer(LtxvTrainer):
 
         if self._evaluation_modelopt_state is not None:
             self._restore_ptq_state_for_evaluation()
+            self._prepare_fixed_parity_probe()
+            self._capture_pre_prepare_probe()
             self._transformer = self._accelerator.prepare(self._transformer)
+            self._capture_post_prepare_probe("restored")
             return
 
         self._run_calibration()
-        self._setup_distillation()
+        self._prepare_fixed_parity_probe()
+        self._capture_pre_prepare_probe()
+        if not self._ptq_only:
+            self._setup_distillation()
 
         self._transformer = self._accelerator.prepare(self._transformer)
+        self._capture_post_prepare_probe("live_post_calibration")
 
         gc.collect()
         torch.cuda.empty_cache()
@@ -470,11 +729,15 @@ class LtxvQADTrainer(LtxvTrainer):
             weights_only=False,
         )
         quantizer_weights = state.pop("modelopt_state_weights", None)
+        expected_inventory = state.pop("quantizer_inventory", None)
+        expected_state_keys = state.pop("quantizer_state_keys", None)
+        state.pop("quantizer_inventory_digest", None)
         if quantizer_weights is None:
             raise ValueError(
                 f"Missing modelopt_state_weights in {self._evaluation_modelopt_state}"
             )
         mto.restore_from_modelopt_state(self._transformer, state)
+        restored_structure_inventory = quantizer_inventory(self._transformer)
         incompatible = self._transformer.load_state_dict(quantizer_weights, strict=False)
         unexpected = [
             key
@@ -483,13 +746,38 @@ class LtxvQADTrainer(LtxvTrainer):
         ]
         if unexpected:
             raise RuntimeError(f"Unexpected PTQ restore keys: {unexpected[:20]}")
-        amax_summary = summarize_amax_state(self._transformer)
-        if amax_summary["total"] == 0 or amax_summary["positive"] == 0:
-            raise RuntimeError(f"Invalid restored amax state: {amax_summary}")
-        if amax_summary["finite"] != amax_summary["total"]:
+        if expected_state_keys is None:
+            expected_state_keys = sorted(quantizer_weights)
             logger.warning(
-                "Restored amax state contains non-finite entries, typically from "
-                f"disabled quantizers: {amax_summary}"
+                "Legacy ModelOpt state has no quantizer_state_keys; "
+                "using serialized quantizer weight keys as restore baseline"
+            )
+        from modelopt.torch.quantization.utils import get_quantizer_state_dict
+
+        restored_quantizer_weights = get_quantizer_state_dict(self._transformer)
+        audit_quantizer_state_keys(expected_state_keys, restored_quantizer_weights)
+        actual_inventory = self._write_quantizer_inventory("restored")
+        if expected_inventory is None:
+            expected_inventory = restored_structure_inventory
+            logger.warning(
+                "Legacy ModelOpt state has no quantizer_inventory; "
+                "using restored pre-load structure as coverage baseline"
+            )
+        coverage = audit_quantizer_coverage(expected_inventory, actual_inventory)
+        if coverage["disabled_nonfinite"]:
+            logger.warning(
+                "Restored disabled quantizers with non-finite amax: "
+                f"{coverage['disabled_nonfinite'][:20]}"
+            )
+        amax_summary = summarize_amax_state(self._transformer)
+        if self._runtime_dynamic_activations:
+            self._runtime_dynamic_reset_names = reset_runtime_dynamic_input_amax(
+                self._transformer
+            )
+            logger.info(
+                f"Reset {len(self._runtime_dynamic_reset_names)} enabled input quantizer "
+                "amax tensors for "
+                "runtime-dynamic activations; NVFP4 dynamic block scales unchanged"
             )
         logger.info(
             f"Restored PTQ-only state from {self._evaluation_modelopt_state}: "
@@ -509,6 +797,131 @@ class LtxvQADTrainer(LtxvTrainer):
         progress = TrainingProgress(enabled=is_global_rank0(), total_steps=1)
         with progress:
             return self._run_validation(progress)
+
+    def _write_quantizer_inventory(self, phase: str) -> list[dict]:
+        """Write rank-local inventory and require identical rank digests."""
+        inventory = quantizer_inventory(self._transformer)
+        digest = inventory_digest(inventory)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        report_path = (
+            Path(self._config.output_dir)
+            / "calibration"
+            / f"quantizer_inventory_{phase}_rank_{rank:02d}.json"
+        )
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(
+            json.dumps(
+                {"rank": rank, "phase": phase, "digest": digest, "quantizers": inventory},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        )
+        if dist.is_initialized() and hasattr(dist, "all_gather_object"):
+            digests = [None] * dist.get_world_size()
+            dist.all_gather_object(digests, digest)
+            if len(set(digests)) != 1:
+                raise RuntimeError(f"Quantizer inventory differs across ranks: {digests}")
+        return inventory
+
+    def _prepare_fixed_parity_probe(self) -> None:
+        """Build one deterministic real calibration input for parity checks."""
+        if self._probe_output is None:
+            return
+        if not hasattr(self, "_training_strategy") or self._training_strategy is None:
+            self._training_strategy = get_training_strategy(self._config.training_strategy)
+        dataset = PrecomputedDataset(
+            self._config.data.preprocessed_data_root,
+            data_sources=self._config.training_strategy.get_data_sources(),
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=self._config.optimization.batch_size,
+            shuffle=False,
+            num_workers=0,
+            drop_last=True,
+        )
+        torch.manual_seed(self._probe_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self._probe_seed)
+        batch = move_batch_to_device(next(iter(loader)), self._accelerator.device)
+        cast_batch_latents(batch, torch.bfloat16)
+        if "conditions" in batch:
+            apply_connectors(batch, self._embeddings_processor)
+        sampler_cls = SAMPLERS[self._config.flow_matching.timestep_sampling_mode]
+        sampler = sampler_cls(**self._config.flow_matching.timestep_sampling_params)
+        inputs = self._training_strategy.prepare_training_inputs(batch, sampler)
+        self._fixed_probe_inputs = cast_model_inputs(inputs, torch.bfloat16)
+        input_tensors = {}
+        for modality_name in ("video", "audio"):
+            modality = getattr(self._fixed_probe_inputs, modality_name)
+            if modality is None:
+                continue
+            for field in fields(modality):
+                value = getattr(modality, field.name)
+                if isinstance(value, torch.Tensor):
+                    input_tensors[f"{modality_name}.{field.name}"] = value
+        self._probe_metadata = {
+            "seed": self._probe_seed,
+            "torch_initial_seed": torch.initial_seed(),
+            "timestep_sampling_mode": self._config.flow_matching.timestep_sampling_mode,
+            "inputs": tensor_output_report(input_tensors),
+            "sigma_digests": {
+                name: tensor_digest(value)
+                for name, value in input_tensors.items()
+                if name.endswith(".sigma")
+            },
+            "timestep_digests": {
+                name: tensor_digest(value)
+                for name, value in input_tensors.items()
+                if name.endswith(".timesteps")
+            },
+        }
+
+    def _capture_pre_prepare_probe(self) -> None:
+        if self._fixed_probe_inputs is None:
+            return
+        self._transformer.eval()
+        with torch.no_grad():
+            self._pre_prepare_probe_output = self._transformer(
+                video=self._fixed_probe_inputs.video,
+                audio=self._fixed_probe_inputs.audio,
+                perturbations=None,
+            )
+
+    def _capture_post_prepare_probe(self, source: str) -> None:
+        if self._fixed_probe_inputs is None:
+            return
+        self._transformer.eval()
+        with torch.no_grad():
+            post_prepare = self._transformer(
+                video=self._fixed_probe_inputs.video,
+                audio=self._fixed_probe_inputs.audio,
+                perturbations=None,
+            )
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        artifact = {
+            "schema_version": 1,
+            "source": source,
+            "rank": rank,
+            "modelopt_state": str(self._evaluation_modelopt_state)
+            if self._evaluation_modelopt_state
+            else None,
+            "runtime_dynamic_activations": self._runtime_dynamic_activations,
+            "runtime_dynamic_reset_names": self._runtime_dynamic_reset_names,
+            "probe": self._probe_metadata,
+            "pre_prepare_output": tensor_output_report(self._pre_prepare_probe_output),
+            "post_prepare_output": tensor_output_report(post_prepare),
+            "pre_vs_post_prepare": compare_tensor_outputs(
+                self._pre_prepare_probe_output, post_prepare
+            ),
+        }
+        output = self._probe_output
+        if dist.is_initialized():
+            output = output.with_name(f"{output.stem}_rank_{rank:02d}{output.suffix}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(artifact, indent=2, sort_keys=True) + "\n")
+        logger.info(f"Wrote fixed-input parity artifact to {output}")
 
     # ── Calibration ───────────────────────────────────────────────────────
 
@@ -630,19 +1043,24 @@ class LtxvQADTrainer(LtxvTrainer):
             )
 
         mtq.quantize(self._transformer, self._quant_cfg, calibration_forward_loop)
+        inventory = self._write_quantizer_inventory("calibrated")
+        audit_quantizer_coverage(inventory, inventory)
         amax_summary = summarize_amax_state(self._transformer)
-        if (
-            amax_summary["total"] == 0
-            or amax_summary["finite"] != amax_summary["total"]
-            or amax_summary["positive"] == 0
-        ):
-            raise RuntimeError(f"Invalid calibrated amax state: {amax_summary}")
         logger.info(f"PTQ calibration complete: amax={amax_summary}")
-        self._save_ptq_state()
+        self._save_ptq_state(inventory)
+        if self._runtime_dynamic_activations:
+            self._runtime_dynamic_reset_names = reset_runtime_dynamic_input_amax(
+                self._transformer
+            )
+            logger.info(
+                f"Reset {len(self._runtime_dynamic_reset_names)} enabled input quantizer "
+                "amax tensors for "
+                "runtime-dynamic activations; NVFP4 dynamic block scales unchanged"
+            )
         if is_global_rank0():
             mtq.print_quant_summary(self._transformer)
 
-    def _save_ptq_state(self) -> None:
+    def _save_ptq_state(self, inventory: list[dict]) -> None:
         """Save restorable step-0 quantizer structure and calibrated state."""
         if not is_global_rank0():
             return
@@ -653,6 +1071,9 @@ class LtxvQADTrainer(LtxvTrainer):
         save_dir.mkdir(exist_ok=True, parents=True)
         state = mto.modelopt_state(self._transformer)
         state["modelopt_state_weights"] = get_quantizer_state_dict(self._transformer)
+        state["quantizer_state_keys"] = sorted(state["modelopt_state_weights"])
+        state["quantizer_inventory"] = inventory
+        state["quantizer_inventory_digest"] = inventory_digest(inventory)
         output_path = save_dir / "modelopt_state_step_00000.pth"
         tmp_path = output_path.with_suffix(".pth.tmp")
         torch.save(state, tmp_path)
@@ -1074,6 +1495,21 @@ def parse_args():
         help="Skip creating inference checkpoint after training",
     )
 
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Calibrate and save PTQ state without teacher creation or optimizer steps",
+    )
+    calibrate_parser.add_argument("--config", type=str, required=True)
+    calibrate_parser.add_argument("--calib-size", type=int, default=512)
+    calibrate_parser.add_argument(
+        "--exclude-blocks", type=int, nargs="*", default=[0, 1, 46, 47]
+    )
+    calibrate_parser.add_argument("--evaluate", action="store_true")
+    calibrate_parser.add_argument("--step", type=int, default=0)
+    calibrate_parser.add_argument("--probe-output", type=str)
+    calibrate_parser.add_argument("--probe-seed", type=int, default=42)
+    calibrate_parser.add_argument("--runtime-dynamic-activations", action="store_true")
+
     # ── Create inference checkpoint command ──
     infer_parser = subparsers.add_parser(
         "create-inference",
@@ -1114,6 +1550,23 @@ def parse_args():
         nargs="*",
         default=[0, 1, 46, 47],
     )
+    eval_parser.add_argument("--probe-output", type=str)
+    eval_parser.add_argument("--probe-seed", type=int, default=42)
+    eval_parser.add_argument("--runtime-dynamic-activations", action="store_true")
+
+    probe_parser = subparsers.add_parser(
+        "parity-probe",
+        help="Restore PTQ state and emit deterministic forward outputs/digests",
+    )
+    probe_parser.add_argument("--config", type=str, required=True)
+    probe_parser.add_argument("--modelopt-state", type=str, required=True)
+    probe_parser.add_argument("--output", type=str, required=True)
+    probe_parser.add_argument("--probe-seed", type=int, default=42)
+    probe_parser.add_argument("--runtime-dynamic-activations", action="store_true")
+    probe_parser.add_argument(
+        "--exclude-blocks", type=int, nargs="*", default=[0, 1, 46, 47]
+    )
+    probe_parser.set_defaults(calib_size=512, kd_loss_weight=0.5)
 
     # Backward compatibility: if no subcommand, treat as train
     args, remaining = parser.parse_known_args()
@@ -1176,8 +1629,9 @@ def main():
 
     # Resolve QAD params: CLI args override YAML values, YAML overrides defaults
     calib_size = args.calib_size if args.calib_size != 512 else qad_config.get("calib_size", 512)
+    arg_kd_loss_weight = getattr(args, "kd_loss_weight", 0.5)
     kd_loss_weight = (
-        args.kd_loss_weight if args.kd_loss_weight != 0.5 else qad_config.get("kd_loss_weight", 0.5)
+        arg_kd_loss_weight if arg_kd_loss_weight != 0.5 else qad_config.get("kd_loss_weight", 0.5)
     )
     exclude_blocks = (
         args.exclude_blocks
@@ -1207,13 +1661,31 @@ def main():
         calib_size=calib_size,
         kd_loss_weight=kd_loss_weight,
         evaluation_modelopt_state=(
-            args.modelopt_state if args.command == "evaluate" else None
+            args.modelopt_state if args.command in {"evaluate", "parity-probe"} else None
         ),
+        ptq_only=args.command == "calibrate",
+        probe_output=(
+            args.output
+            if args.command == "parity-probe"
+            else getattr(args, "probe_output", None)
+        ),
+        probe_seed=getattr(args, "probe_seed", 42),
+        runtime_dynamic_activations=getattr(args, "runtime_dynamic_activations", False),
     )
 
-    if args.command == "evaluate":
+    if args.command == "parity-probe":
+        logger.info(f"Parity probe complete: {args.output}")
+        return
+
+    if args.command == "evaluate" or (
+        args.command == "calibrate" and getattr(args, "evaluate", False)
+    ):
         paths = trainer.evaluate(step=args.step)
         logger.info(f"Evaluation complete: {len(paths)} samples on rank")
+        return
+
+    if args.command == "calibrate":
+        logger.info("PTQ-only calibration complete; no teacher or optimizer step was created")
         return
 
     saved_path, stats = trainer.train()
