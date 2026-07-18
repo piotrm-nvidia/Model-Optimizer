@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .attribution import run_tensor_attribution
 from .runtime import (
     create_deploy,
     evaluate_bundle,
@@ -67,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_parser.add_argument("--qad-root", type=Path, required=True)
     matrix_parser.add_argument("--output", type=Path, required=True)
     matrix_parser.add_argument("--resume", action="store_true")
+
+    attribution_parser = commands.add_parser("tensor-attribution")
+    attribution_parser.add_argument("--checkpoint", type=Path, required=True)
+    attribution_parser.add_argument("--config", type=Path, required=True)
+    attribution_parser.add_argument("--manifest", type=Path, required=True)
+    attribution_parser.add_argument("--output", type=Path, required=True)
+    attribution_parser.add_argument("--sample-id", required=True)
+    attribution_parser.add_argument("--seed", type=int, required=True)
     return parser
 
 
@@ -129,6 +138,15 @@ def main() -> None:
             qad_root=args.qad_root,
             output=args.output,
             resume=args.resume,
+        )
+    elif args.command == "tensor-attribution":
+        run_tensor_attribution(
+            bundle=args.checkpoint,
+            config_path=args.config,
+            manifest_path=args.manifest,
+            output=args.output,
+            sample_id=args.sample_id,
+            seed=args.seed,
         )
     else:
         raise ValueError(args.command)
