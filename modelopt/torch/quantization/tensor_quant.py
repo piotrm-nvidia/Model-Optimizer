@@ -77,6 +77,10 @@ def scaled_e4m3_impl(
     Returns:
         Input tensors faked quantized to FP8.
     """
+    if inputs.is_cuda and amax is not None and amax.device != inputs.device:
+        raise ValueError(
+            f"FP8 amax must be on the input device: input={inputs.device}, amax={amax.device}"
+        )
     if (not inputs.is_cuda) or amax is None or amax.squeeze().ndim > 1:
         return fp8_eager(inputs, amax)
 
