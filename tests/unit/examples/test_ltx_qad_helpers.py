@@ -131,6 +131,22 @@ def test_dynamic_amax_is_registered_before_strict_restore() -> None:
     assert model[0].amax.item() == 12.0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_dynamic_amax_restore_can_preserve_existing_model_device() -> None:
+    model = nn.Sequential(
+        TensorQuantizer(QuantizerAttributeConfig(num_bits=(4, 3), axis=None))
+    ).cuda()
+    target_device = next(model.parameters(), torch.empty(0, device="cuda")).device
+    state = {"0": {"_amax": torch.tensor(12.0)}}
+
+    register_dynamic_quantizer_buffers(model, state)
+    model[0].load_state_dict(state["0"])
+    model.to(device=target_device)
+
+    assert model[0].amax.device == target_device
+    assert model[0].amax.item() == 12.0
+
+
 def test_quantizer_evidence_requires_enabled_weight_input_and_valid_amax() -> None:
     model = nn.Module()
     model.weight_quantizer = TensorQuantizer(QuantizerAttributeConfig(num_bits=(4, 3), axis=None))

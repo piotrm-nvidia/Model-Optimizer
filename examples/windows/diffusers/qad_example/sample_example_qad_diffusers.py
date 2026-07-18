@@ -81,6 +81,7 @@ import modelopt.torch.distill as mtd
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 from modelopt.torch.distill.distillation_model import DistillationModel
+from modelopt.torch.quantization.nn import TensorQuantizer
 from modelopt.torch.quantization.plugins.diffusion.ltx2 import register_ltx2_quant_linear
 from modelopt.torch.utils import safe_load
 
@@ -303,6 +304,7 @@ def apply_connectors(batch, embeddings_processor):
 
 def restore_quantized_model(model, modelopt_state_path: str | Path):
     """Restore quantized architecture and quantizer tensors onto an LTX transformer."""
+    target_device = next(model.parameters()).device
     state = safe_load(modelopt_state_path, map_location="cpu")
     quantizer_state = state.pop("modelopt_state_weights", None)
     if not isinstance(quantizer_state, dict) or not quantizer_state:
@@ -313,8 +315,21 @@ def restore_quantized_model(model, modelopt_state_path: str | Path):
 
     registered = register_dynamic_quantizer_buffers(model, quantizer_state)
     set_quantizer_state_dict(model, quantizer_state)
+    model.to(device=target_device)
     summary = summarize_quantizer_state(model)
     validate_quantizer_state(summary)
+    wrong_device = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, TensorQuantizer)
+        and module.is_enabled
+        and hasattr(module, "_amax")
+        and module.amax.device != target_device
+    ]
+    if wrong_device:
+        raise RuntimeError(
+            f"Restored quantizer amax buffers are not on {target_device}: {wrong_device[:20]}"
+        )
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     digest = quantizer_state_digest(quantizer_state)
