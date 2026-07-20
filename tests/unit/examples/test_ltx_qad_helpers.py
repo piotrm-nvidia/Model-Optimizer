@@ -14,11 +14,13 @@ from modelopt.torch.quantization.utils import (
 )
 
 from examples.windows.diffusers.qad_example.sample_example_qad_diffusers import (
+    attach_quantizer_restore_metadata,
     audit_quantizer_coverage,
     audit_quantizer_state_keys,
     calibration_step_count,
     cast_model_inputs,
     compare_tensor_outputs,
+    enrich_modelopt_state_with_template,
     inventory_digest,
     quantizer_inventory,
     reset_runtime_dynamic_input_amax,
@@ -284,3 +286,46 @@ def test_tensor_output_report_and_comparison():
     assert close_comparison["allclose"] is True
     assert close_comparison["tensors"]["output.0"]["exact_digest"] is False
     assert far_comparison["allclose"] is False
+
+
+def test_attach_quantizer_restore_metadata_adds_inventory_keys():
+    model = _QuantizerModel()
+    state = {"modelopt_version": "test"}
+
+    attach_quantizer_restore_metadata(state, model=model)
+
+    assert state["quantizer_state_keys"] == sorted(state["modelopt_state_weights"])
+    assert len(state["quantizer_inventory"]) == 3
+    assert state["quantizer_inventory_digest"] == inventory_digest(state["quantizer_inventory"])
+
+
+def test_enrich_modelopt_state_with_template_overlays_amax_digests():
+    template_model = _QuantizerModel()
+    template = attach_quantizer_restore_metadata({"modelopt_version": "template"}, model=template_model)
+
+    legacy_model = _QuantizerModel()
+    set_quantizer_state_dict(
+        legacy_model,
+        {
+            "enabled_input_quantizer._amax": torch.tensor(2.0),
+            "enabled_weight_quantizer._amax": torch.tensor(9.0),
+            "disabled_input_quantizer._amax": torch.tensor(float("nan")),
+        },
+    )
+    legacy = {
+        "modelopt_version": "legacy",
+        "modelopt_state_weights": get_quantizer_state_dict(legacy_model),
+    }
+
+    enrich_modelopt_state_with_template(legacy, template["quantizer_inventory"])
+
+    assert "quantizer_state_keys" in legacy
+    assert "quantizer_inventory" in legacy
+    weight_item = next(
+        item
+        for item in legacy["quantizer_inventory"]
+        if item["fqn"].endswith("enabled_weight_quantizer")
+    )
+    assert weight_item["amax"]["present"] is True
+    assert weight_item["amax"]["digest"] is not None
+    assert legacy["quantizer_inventory_digest"] == inventory_digest(legacy["quantizer_inventory"])

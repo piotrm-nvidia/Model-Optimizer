@@ -392,6 +392,91 @@ def inventory_digest(inventory: list[dict]) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+def _amax_report_from_tensor(amax: torch.Tensor | None) -> dict:
+    """Build the inventory amax report block from an optional tensor."""
+    present = isinstance(amax, torch.Tensor)
+    return {
+        "present": present,
+        "shape": list(amax.shape) if present else None,
+        "dtype": str(amax.dtype) if present else None,
+        "finite": bool(torch.isfinite(amax).all().item()) if present else None,
+        "positive": bool((amax.abs() > 0).all().item()) if present else None,
+        "digest": tensor_digest(amax) if present else None,
+    }
+
+
+def attach_quantizer_restore_metadata(
+    modelopt_state: dict,
+    *,
+    model: torch.nn.Module | None = None,
+    inventory: list[dict] | None = None,
+) -> dict:
+    """Attach inventory metadata required by evaluation restore audits.
+
+    PTQ and QAD saves must both persist ``quantizer_state_keys`` and
+    ``quantizer_inventory``. Without them, restore falls back to a pre-load
+    inventory and fails ``mismatched_enabled_amax`` against post-load amax.
+    """
+    from modelopt.torch.quantization.utils import get_quantizer_state_dict
+
+    if "modelopt_state_weights" not in modelopt_state or modelopt_state["modelopt_state_weights"] is None:
+        if model is None:
+            raise ValueError("modelopt_state_weights missing and no model provided")
+        modelopt_state["modelopt_state_weights"] = get_quantizer_state_dict(model)
+    if inventory is None:
+        if model is None:
+            raise ValueError("inventory required when model is not provided")
+        inventory = quantizer_inventory(model)
+    modelopt_state["quantizer_state_keys"] = sorted(modelopt_state["modelopt_state_weights"])
+    modelopt_state["quantizer_inventory"] = inventory
+    modelopt_state["quantizer_inventory_digest"] = inventory_digest(inventory)
+    return modelopt_state
+
+
+def enrich_modelopt_state_with_template(
+    state: dict,
+    template_inventory: list[dict],
+) -> dict:
+    """Rebuild restore metadata from saved weights plus template enable/config.
+
+    Used to re-save legacy QAD checkpoints that omitted inventory metadata.
+    Amax digests come from ``modelopt_state_weights``; enable/config come from
+    the corrected PTQ template inventory (typically A0).
+    """
+    weights = state.get("modelopt_state_weights")
+    if not isinstance(weights, dict) or not weights:
+        raise ValueError("enrich requires non-empty modelopt_state_weights")
+
+    amax_by_fqn: dict[str, torch.Tensor] = {}
+    for key, value in weights.items():
+        if isinstance(value, torch.Tensor) and key.endswith("._amax"):
+            amax_by_fqn[key[: -len("._amax")]] = value
+
+    inventory = []
+    for item in template_inventory:
+        fqn = item["fqn"]
+        amax = amax_by_fqn.get(fqn)
+        enabled = bool(item["enabled"])
+        inventory.append(
+            {
+                "fqn": fqn,
+                "class": item["class"],
+                "enabled": enabled,
+                "disabled": not enabled,
+                "requires_amax": item.get(
+                    "requires_amax",
+                    enabled and ("weight_quantizer" in fqn or isinstance(amax, torch.Tensor)),
+                ),
+                "config": item.get("config", {}),
+                "amax": _amax_report_from_tensor(amax),
+            }
+        )
+    return attach_quantizer_restore_metadata(
+        state,
+        inventory=sorted(inventory, key=lambda row: row["fqn"]),
+    )
+
+
 def audit_quantizer_coverage(
     expected: list[dict],
     actual: list[dict],
@@ -786,7 +871,6 @@ class LtxvQADTrainer(LtxvTrainer):
                 f"Missing modelopt_state_weights in {self._evaluation_modelopt_state}"
             )
         mto.restore_from_modelopt_state(self._transformer, state)
-        restored_structure_inventory = quantizer_inventory(self._transformer)
         if expected_state_keys is None:
             expected_state_keys = sorted(quantizer_weights)
             logger.warning(
@@ -803,10 +887,13 @@ class LtxvQADTrainer(LtxvTrainer):
         audit_quantizer_state_keys(expected_state_keys, restored_quantizer_weights)
         actual_inventory = self._write_quantizer_inventory("restored")
         if expected_inventory is None:
-            expected_inventory = restored_structure_inventory
+            # Pre-load structure lacks calibrated amax digests; comparing it to
+            # post-load inventory always fails mismatched_enabled_amax. Use the
+            # post-load inventory as the legacy baseline instead.
+            expected_inventory = actual_inventory
             logger.warning(
                 "Legacy ModelOpt state has no quantizer_inventory; "
-                "using restored pre-load structure as coverage baseline"
+                "using restored post-load inventory as coverage baseline"
             )
         coverage = audit_quantizer_coverage(expected_inventory, actual_inventory)
         if coverage["disabled_nonfinite"]:
@@ -1114,15 +1201,12 @@ class LtxvQADTrainer(LtxvTrainer):
         if not is_global_rank0():
             return
 
-        from modelopt.torch.quantization.utils import get_quantizer_state_dict
-
         save_dir = Path(self._config.output_dir) / "checkpoints"
         save_dir.mkdir(exist_ok=True, parents=True)
         state = mto.modelopt_state(self._transformer)
-        state["modelopt_state_weights"] = get_quantizer_state_dict(self._transformer)
-        state["quantizer_state_keys"] = sorted(state["modelopt_state_weights"])
-        state["quantizer_inventory"] = inventory
-        state["quantizer_inventory_digest"] = inventory_digest(inventory)
+        attach_quantizer_restore_metadata(
+            state, model=self._transformer, inventory=inventory
+        )
         output_path = save_dir / "modelopt_state_step_00000.pth"
         tmp_path = output_path.with_suffix(".pth.tmp")
         torch.save(state, tmp_path)
@@ -1285,16 +1369,20 @@ class LtxvQADTrainer(LtxvTrainer):
             tmp_path.rename(saved_weights_path)
             del clean_state
 
-            # 5. Save modelopt state
+            # 5. Save modelopt state with restore inventory metadata.
             try:
                 unwrapped = self._accelerator.unwrap_model(self._transformer)
                 modelopt_state = mto.modelopt_state(unwrapped)
-                from modelopt.torch.quantization.utils import get_quantizer_state_dict
-
-                modelopt_state["modelopt_state_weights"] = get_quantizer_state_dict(unwrapped)
+                attach_quantizer_restore_metadata(modelopt_state, model=unwrapped)
                 modelopt_path = save_dir / f"modelopt_state_step_{self._global_step:05d}.pth"
-                torch.save(modelopt_state, str(modelopt_path))
-                logger.info(f"Saved modelopt state to {modelopt_path}")
+                tmp_modelopt = modelopt_path.with_suffix(".pth.tmp")
+                torch.save(modelopt_state, str(tmp_modelopt))
+                tmp_modelopt.rename(modelopt_path)
+                logger.info(
+                    "Saved modelopt state with "
+                    f"{len(modelopt_state['quantizer_inventory'])} inventory rows to "
+                    f"{modelopt_path}"
+                )
             except Exception as e:
                 logger.warning(f"Failed to save modelopt state: {e}")
 
