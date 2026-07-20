@@ -110,7 +110,13 @@ NON_TRANSFORMER_PREFIXES = [
 ]
 STRIP_PREFIXES = ["diffusion_model.", "transformer.", "_orig_mod.", "model."]
 CORRECT_PREFIX = "model.diffusion_model."
-QUANT_RECIPES = ("nvfp4", "fp8")
+QUANT_RECIPE_PRESETS = {
+    "fp8": "FP8_DEFAULT_CFG",
+    "int8": "INT8_DEFAULT_CFG",
+    "int8_smoothquant": "INT8_SMOOTHQUANT_CFG",
+    "int4_awq": "INT4_AWQ_CFG",
+}
+QUANT_RECIPES = ("nvfp4", *QUANT_RECIPE_PRESETS)
 
 SENSITIVE_LAYER_PATTERNS = [
     "*patchify_proj*",
@@ -350,7 +356,8 @@ def build_quant_config(
     Args:
         exclude_blocks: Transformer block indices to exclude from quantization.
             Defaults to [0, 1, 46, 47] (first 2 and last 2).
-        recipe: ``nvfp4`` or ``fp8``.
+        recipe: One of ``nvfp4``, ``fp8``, ``int8``, ``int8_smoothquant``,
+            or ``int4_awq``.
     """
     if exclude_blocks is None:
         exclude_blocks = [0, 1, 46, 47]
@@ -362,8 +369,9 @@ def build_quant_config(
             for i in exclude_blocks
         ],
     ]
-    if recipe == "fp8":
-        quant_config = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+    if recipe in QUANT_RECIPE_PRESETS:
+        preset_name = QUANT_RECIPE_PRESETS[recipe]
+        quant_config = copy.deepcopy(getattr(mtq, preset_name))
         quant_config["quant_cfg"].extend(exclusions)
         return quant_config
     if recipe != "nvfp4":

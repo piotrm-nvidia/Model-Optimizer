@@ -115,7 +115,7 @@ All of the following can be set in `ltx2_qad.yaml`. QAD-specific options can als
 
 | Section | Key | Default (example) | Description |
 |--------|-----|--------------------|-------------|
-| **qad** | `quant_recipe` | `"nvfp4"` | Quantization recipe: `nvfp4` or `fp8`. |
+| **qad** | `quant_recipe` | `"nvfp4"` | Quantization recipe: `nvfp4`, `fp8`, `int8`, `int8_smoothquant`, or `int4_awq`. |
 | **qad** | `calib_size` | `512` | Number of calibration batches for PTQ (more = better scale estimates, slower startup). |
 | **qad** | `kd_loss_weight` | `0.5` | Weight for distillation loss in combined loss; `0` = task loss only, `1` = distillation only. |
 | **qad** | `exclude_blocks` | `[0, 1, 46, 47]` | Transformer block indices to exclude from quantization (e.g. first/last blocks). |

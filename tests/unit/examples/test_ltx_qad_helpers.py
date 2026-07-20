@@ -88,7 +88,7 @@ def test_summarize_amax_state_counts_finite_positive_values():
     }
 
 
-@pytest.mark.parametrize("recipe", ["nvfp4", "fp8"])
+@pytest.mark.parametrize("recipe", ["nvfp4", "fp8", "int8", "int8_smoothquant", "int4_awq"])
 def test_build_quant_config_preserves_sensitive_and_block_exclusions(recipe):
     config = build_quant_config(exclude_blocks=[3, 9], recipe=recipe)
     disabled = {
@@ -100,14 +100,51 @@ def test_build_quant_config_preserves_sensitive_and_block_exclusions(recipe):
     assert "*transformer_blocks.9.*" in disabled
 
 
-def test_build_fp8_quant_config_does_not_mutate_default():
-    original_length = len(qad.mtq.FP8_DEFAULT_CFG["quant_cfg"])
+@pytest.mark.parametrize(
+    ("recipe", "preset_name"),
+    [
+        ("fp8", "FP8_DEFAULT_CFG"),
+        ("int8", "INT8_DEFAULT_CFG"),
+        ("int8_smoothquant", "INT8_SMOOTHQUANT_CFG"),
+        ("int4_awq", "INT4_AWQ_CFG"),
+    ],
+)
+def test_build_preset_quant_config_does_not_mutate_default(recipe, preset_name):
+    preset = getattr(qad.mtq, preset_name)
+    original_length = len(preset["quant_cfg"])
 
-    config = build_quant_config(exclude_blocks=[7], recipe="fp8")
+    config = build_quant_config(exclude_blocks=[7], recipe=recipe)
 
-    assert config is not qad.mtq.FP8_DEFAULT_CFG
-    assert len(qad.mtq.FP8_DEFAULT_CFG["quant_cfg"]) == original_length
+    assert config is not preset
+    assert len(preset["quant_cfg"]) == original_length
     assert len(config["quant_cfg"]) > original_length
+
+
+def _quantizer_entry(config, name):
+    return next(entry for entry in config["quant_cfg"] if entry.get("quantizer_name") == name)
+
+
+@pytest.mark.parametrize("recipe", ["int8", "int8_smoothquant"])
+def test_build_int8_quant_config_preserves_w8a8_granularity(recipe):
+    config = build_quant_config(recipe=recipe)
+    weight = _quantizer_entry(config, "*weight_quantizer")["cfg"]
+    activation = _quantizer_entry(config, "*input_quantizer")["cfg"]
+
+    assert weight["num_bits"] == 8
+    assert weight["axis"] == 0
+    assert activation["num_bits"] == 8
+    assert activation["axis"] is None
+
+
+def test_build_int4_awq_quant_config_preserves_w4a16_policy():
+    config = build_quant_config(recipe="int4_awq")
+    weight = _quantizer_entry(config, "*weight_quantizer")["cfg"]
+    activation = _quantizer_entry(config, "*input_quantizer")
+
+    assert weight["num_bits"] == 4
+    assert weight["block_sizes"] == {-1: 128, "type": "static"}
+    assert activation["enable"] is False
+    assert config["algorithm"]["method"] == "awq_lite"
 
 
 def test_restore_quantizer_state_uses_quantizer_helper(monkeypatch):
