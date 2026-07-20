@@ -38,6 +38,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import json
 import logging
@@ -57,8 +58,8 @@ from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer.config import LtxTrainerConfig
 from ltx_trainer.datasets import PrecomputedDataset
 from ltx_trainer.model_loader import load_transformer
-from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.progress import TrainingProgress
+from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.trainer import LtxvTrainer, TrainingStepOutput
 from ltx_trainer.training_strategies import get_training_strategy
 from torch.utils.data import DataLoader
@@ -68,7 +69,8 @@ import modelopt.torch.distill as mtd
 import modelopt.torch.opt as mto
 import modelopt.torch.quantization as mtq
 from modelopt.torch.distill.distillation_model import DistillationModel
-from modelopt.torch.quantization.config import NVFP4_DEFAULT_CFG
+from modelopt.torch.quantization.plugins.diffusion.ltx2 import register_ltx2_quant_linear
+from modelopt.torch.quantization.utils import set_quantizer_state_dict
 from modelopt.torch.utils import safe_load
 
 warnings.warn(
@@ -108,6 +110,7 @@ NON_TRANSFORMER_PREFIXES = [
 ]
 STRIP_PREFIXES = ["diffusion_model.", "transformer.", "_orig_mod.", "model."]
 CORRECT_PREFIX = "model.diffusion_model."
+QUANT_RECIPES = ("nvfp4", "fp8")
 
 SENSITIVE_LAYER_PATTERNS = [
     "*patchify_proj*",
@@ -310,8 +313,7 @@ def validate_calibration_counts(attempted: int, successful: int, failed: int) ->
         raise RuntimeError(f"Calibration produced zero successful batches out of {attempted}")
     if failed > attempted * 0.5:
         raise RuntimeError(
-            f"Too many calibration failures ({failed}/{attempted}); "
-            f"successful batches={successful}"
+            f"Too many calibration failures ({failed}/{attempted}); successful batches={successful}"
         )
 
 
@@ -341,35 +343,56 @@ def apply_connectors(batch, embeddings_processor):
 
 def build_quant_config(
     exclude_blocks: list[int] | None = None,
+    recipe: str = "nvfp4",
 ) -> dict:
-    """Build the NVFP4 quantization config with sensitive layers excluded.
+    """Build a QAD quantization config with sensitive layers excluded.
 
     Args:
         exclude_blocks: Transformer block indices to exclude from quantization.
             Defaults to [0, 1, 46, 47] (first 2 and last 2).
+        recipe: ``nvfp4`` or ``fp8``.
     """
     if exclude_blocks is None:
         exclude_blocks = [0, 1, 46, 47]
 
-    _nvfp4_cfg = {
-        "num_bits": (2, 1),
-        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
-        "axis": None,
-    }
-    quant_cfg = [
-        {"quantizer_name": "*weight_quantizer", "cfg": _nvfp4_cfg, "enable": True},
-        {"quantizer_name": "*input_quantizer", "cfg": _nvfp4_cfg, "enable": True},
+    exclusions = [
         *[{"quantizer_name": pattern, "enable": False} for pattern in SENSITIVE_LAYER_PATTERNS],
         *[
             {"quantizer_name": f"*transformer_blocks.{i}.*", "enable": False}
             for i in exclude_blocks
         ],
     ]
+    if recipe == "fp8":
+        quant_config = copy.deepcopy(mtq.FP8_DEFAULT_CFG)
+        quant_config["quant_cfg"].extend(exclusions)
+        return quant_config
+    if recipe != "nvfp4":
+        raise ValueError(f"Unknown quantization recipe {recipe!r}; choose from {QUANT_RECIPES}")
 
-    return {
-        "quant_cfg": quant_cfg,
-        "algorithm": NVFP4_DEFAULT_CFG["algorithm"],
+    nvfp4_cfg = {
+        "num_bits": (2, 1),
+        "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+        "axis": None,
     }
+    return {
+        "quant_cfg": [
+            {"quantizer_name": "*weight_quantizer", "cfg": nvfp4_cfg, "enable": True},
+            {"quantizer_name": "*input_quantizer", "cfg": nvfp4_cfg, "enable": True},
+            *exclusions,
+        ],
+        "algorithm": mtq.NVFP4_DEFAULT_CFG["algorithm"],
+    }
+
+
+def restore_quantizer_state(model: torch.nn.Module, state: dict) -> None:
+    """Restore ModelOpt structure and quantizer values from a saved QAD state."""
+    state = dict(state)
+    quantizer_state = state.pop("modelopt_state_weights", None)
+    if quantizer_state is None:
+        raise ValueError("Missing modelopt_state_weights in ModelOpt state")
+    register_ltx2_quant_linear()
+    mto.restore_from_modelopt_state(model, state)
+    set_quantizer_state_dict(model, quantizer_state)
 
 
 # ─── Distillation loss ───────────────────────────────────────────────────────
@@ -469,20 +492,7 @@ class LtxvQADTrainer(LtxvTrainer):
             map_location="cpu",
             weights_only=False,
         )
-        quantizer_weights = state.pop("modelopt_state_weights", None)
-        if quantizer_weights is None:
-            raise ValueError(
-                f"Missing modelopt_state_weights in {self._evaluation_modelopt_state}"
-            )
-        mto.restore_from_modelopt_state(self._transformer, state)
-        incompatible = self._transformer.load_state_dict(quantizer_weights, strict=False)
-        unexpected = [
-            key
-            for key in incompatible.unexpected_keys
-            if "quantizer" not in key and "_amax" not in key
-        ]
-        if unexpected:
-            raise RuntimeError(f"Unexpected PTQ restore keys: {unexpected[:20]}")
+        restore_quantizer_state(self._transformer, state)
         amax_summary = summarize_amax_state(self._transformer)
         if (
             amax_summary["total"] == 0
@@ -491,8 +501,7 @@ class LtxvQADTrainer(LtxvTrainer):
         ):
             raise RuntimeError(f"Invalid restored amax state: {amax_summary}")
         logger.info(
-            f"Restored PTQ-only state from {self._evaluation_modelopt_state}: "
-            f"amax={amax_summary}"
+            f"Restored PTQ-only state from {self._evaluation_modelopt_state}: amax={amax_summary}"
         )
 
     def evaluate(self, step: int) -> list[Path]:
@@ -589,8 +598,7 @@ class LtxvQADTrainer(LtxvTrainer):
 
                     if successes % 50 == 0 or (i + 1) == calib_steps:
                         logger.info(
-                            f"Calibrated {successes}/{calib_steps} batches "
-                            f"({failures} failures)"
+                            f"Calibrated {successes}/{calib_steps} batches ({failures} failures)"
                         )
 
             validate_calibration_counts(calib_steps, successes, failures)
@@ -602,9 +610,7 @@ class LtxvQADTrainer(LtxvTrainer):
 
             rank = dist.get_rank() if dist.is_initialized() else 0
             report_path = (
-                Path(self._config.output_dir)
-                / "calibration"
-                / f"calibration_rank_{rank:02d}.json"
+                Path(self._config.output_dir) / "calibration" / f"calibration_rank_{rank:02d}.json"
             )
             report_path.parent.mkdir(parents=True, exist_ok=True)
             report_path.write_text(
@@ -622,6 +628,7 @@ class LtxvQADTrainer(LtxvTrainer):
                 + "\n"
             )
 
+        register_ltx2_quant_linear()
         mtq.quantize(self._transformer, self._quant_cfg, calibration_forward_loop)
         amax_summary = summarize_amax_state(self._transformer)
         if (
@@ -721,9 +728,7 @@ class LtxvQADTrainer(LtxvTrainer):
 
         save_dir = Path(self._config.output_dir) / "checkpoints"
         prefix = "model" if self._config.model.training_mode == "full" else "lora"
-        saved_weights_path = (
-            save_dir / f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
-        )
+        saved_weights_path = save_dir / f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
         if self._global_step in self._saved_qad_steps:
             logger.info(f"Checkpoint step {self._global_step} already saved; reusing it")
             return saved_weights_path
@@ -826,6 +831,159 @@ class LtxvQADTrainer(LtxvTrainer):
 
 
 # ─── Standalone inference checkpoint creation ─────────────────────────────────
+
+
+def _strip_export_prefix(key: str) -> str:
+    """Normalize trainer/ModelOpt wrapper names to an LTX transformer key."""
+    prefixes = (
+        CORRECT_PREFIX,
+        "_student_model.",
+        "module.",
+        "_orig_mod.",
+        "diffusion_model.",
+        "transformer.",
+        "velocity_model.",
+        "model.",
+    )
+    previous = None
+    while key != previous:
+        previous = key
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix) :]
+                break
+    return key
+
+
+def _scalar_fp8_scale(quantizer_name: str, quantizer_state: dict) -> torch.Tensor | None:
+    """Return scalar E4M3 dequantization scale, or None for an uncalibrated quantizer."""
+    amax = quantizer_state.get("_amax")
+    if amax is None:
+        return None
+    if not isinstance(amax, torch.Tensor) or amax.numel() != 1:
+        raise ValueError(f"{quantizer_name} has non-scalar amax; saved state is not per-tensor FP8")
+    amax = amax.detach().cpu().float().abs().reshape(())
+    if not torch.isfinite(amax) or amax <= 0:
+        raise ValueError(f"{quantizer_name} has invalid amax {amax.item()}")
+    return (amax / 448.0).to(torch.float32)
+
+
+def extract_fp8_linear_scales(
+    quantizer_state: dict[str, dict],
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    """Extract calibrated weight/input scales for enabled FP8 linears."""
+    scales = {}
+    suffix = ".weight_quantizer"
+    for quantizer_name, state in quantizer_state.items():
+        if not quantizer_name.endswith(suffix):
+            continue
+        weight_scale = _scalar_fp8_scale(quantizer_name, state)
+        if weight_scale is None:
+            continue
+        module_name = quantizer_name[: -len(suffix)]
+        input_name = f"{module_name}.input_quantizer"
+        input_state = quantizer_state.get(input_name)
+        if input_state is None:
+            raise ValueError(f"Missing {input_name} for calibrated FP8 linear")
+        input_scale = _scalar_fp8_scale(input_name, input_state)
+        if input_scale is None:
+            raise ValueError(f"Missing calibrated amax for {input_name}")
+        normalized_name = _strip_export_prefix(module_name)
+        scales[normalized_name] = (weight_scale, input_scale)
+    if not scales:
+        raise ValueError("ModelOpt state contains no calibrated per-tensor FP8 linears")
+    return scales
+
+
+def convert_ltx_fp8_transformer_state(
+    trained_state: dict[str, torch.Tensor],
+    quantizer_state: dict[str, dict],
+) -> dict[str, torch.Tensor]:
+    """Convert BF16 student weights plus ModelOpt amax state to LTX FP8 tensors."""
+    scales = extract_fp8_linear_scales(quantizer_state)
+    normalized_state = {}
+    for key, value in trained_state.items():
+        if is_removable_key(key) or is_non_transformer(key):
+            continue
+        normalized_key = _strip_export_prefix(key)
+        if normalized_key in normalized_state:
+            raise ValueError(f"Duplicate normalized checkpoint key: {normalized_key}")
+        normalized_state[normalized_key] = value.detach().cpu()
+
+    converted = {}
+    exported_linears = set()
+    for key, value in normalized_state.items():
+        module_name = key[: -len(".weight")] if key.endswith(".weight") else None
+        if module_name in scales:
+            if not value.is_floating_point():
+                raise TypeError(f"FP8 linear weight must be floating point: {key}")
+            weight_scale, input_scale = scales[module_name]
+            converted[key] = ((value.float() / weight_scale).clamp(min=-448.0, max=448.0)).to(
+                torch.float8_e4m3fn
+            )
+            converted[f"{module_name}.weight_scale"] = weight_scale.reshape(())
+            converted[f"{module_name}.input_scale"] = input_scale.reshape(())
+            exported_linears.add(module_name)
+        elif value.is_floating_point():
+            converted[key] = value.to(torch.bfloat16)
+        else:
+            converted[key] = value
+
+    missing = sorted(set(scales) - exported_linears)
+    if missing:
+        raise KeyError(
+            f"Trained checkpoint missing {len(missing)} FP8 linear weights: {missing[:5]}"
+        )
+    return converted
+
+
+def create_fp8_deploy_checkpoint(
+    trained_path: str,
+    modelopt_state_path: str,
+    base_path: str,
+    output_path: str,
+) -> None:
+    """Create merged LTX checkpoint with per-tensor E4M3 transformer linears."""
+    from safetensors.torch import save_file
+
+    from modelopt.torch.export.diffusers_utils import (
+        build_layerwise_quant_metadata,
+        merge_diffusion_checkpoint,
+    )
+
+    paths = {
+        "trained": Path(trained_path),
+        "ModelOpt state": Path(modelopt_state_path),
+        "base": Path(base_path),
+    }
+    for label, path in paths.items():
+        if not path.exists():
+            raise FileNotFoundError(f"{label} checkpoint not found: {path}")
+
+    trained_state, _ = load_state_dict_any_format(str(paths["trained"]), label="trained")
+    modelopt_state = torch.load(paths["ModelOpt state"], map_location="cpu", weights_only=False)
+    quantizer_state = modelopt_state.get("modelopt_state_weights")
+    if not isinstance(quantizer_state, dict):
+        raise ValueError(f"Missing modelopt_state_weights in {paths['ModelOpt state']}")
+
+    transformer_state = convert_ltx_fp8_transformer_state(trained_state, quantizer_state)
+    hf_quant_config = {"quant_algo": "FP8"}
+    merged, metadata = merge_diffusion_checkpoint(
+        transformer_state,
+        str(paths["base"]),
+        "ltx2",
+        hf_quant_config=hf_quant_config,
+    )
+    metadata["_quantization_metadata"] = build_layerwise_quant_metadata(merged, hf_quant_config)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(".safetensors.tmp")
+    save_file(merged, str(temporary), metadata=metadata)
+    temporary.rename(output)
+    logger.info(
+        f"Created FP8 deploy checkpoint {output}: "
+        f"{sum(v.dtype == torch.float8_e4m3fn for v in merged.values())} FP8 weights"
+    )
 
 
 def create_inference_checkpoint(
@@ -1062,6 +1220,12 @@ def parse_args():
         help="Transformer block indices to exclude from quantization",
     )
     train_parser.add_argument(
+        "--quant-recipe",
+        choices=QUANT_RECIPES,
+        default=None,
+        help="Quantization recipe (default: qad.quant_recipe or nvfp4)",
+    )
+    train_parser.add_argument(
         "--skip-inference-ckpt",
         action="store_true",
         help="Skip creating inference checkpoint after training",
@@ -1091,6 +1255,16 @@ def parse_args():
         help="Output path for inference .safetensors",
     )
 
+    # ── Create FP8 deploy checkpoint command ──
+    fp8_parser = subparsers.add_parser(
+        "create-fp8-deploy",
+        help="Create merged LTX FP8 checkpoint from BF16 student and ModelOpt state",
+    )
+    fp8_parser.add_argument("--trained", type=str, required=True)
+    fp8_parser.add_argument("--modelopt-state", type=str, required=True)
+    fp8_parser.add_argument("--base", type=str, required=True)
+    fp8_parser.add_argument("--output", type=str, required=True)
+
     # ── Evaluate quantized checkpoint command ──
     eval_parser = subparsers.add_parser(
         "evaluate",
@@ -1106,6 +1280,12 @@ def parse_args():
         type=int,
         nargs="*",
         default=[0, 1, 46, 47],
+    )
+    eval_parser.add_argument(
+        "--quant-recipe",
+        choices=QUANT_RECIPES,
+        default=None,
+        help="Quantization recipe (default: qad.quant_recipe or nvfp4)",
     )
 
     # Backward compatibility: if no subcommand, treat as train
@@ -1155,6 +1335,14 @@ def main():
             output_path=args.output,
         )
         return
+    if args.command == "create-fp8-deploy":
+        create_fp8_deploy_checkpoint(
+            trained_path=args.trained,
+            modelopt_state_path=args.modelopt_state,
+            base_path=args.base,
+            output_path=args.output,
+        )
+        return
 
     # ── Train ──
     import yaml
@@ -1177,11 +1365,12 @@ def main():
         if args.exclude_blocks != [0, 1, 46, 47]
         else qad_config.get("exclude_blocks", [0, 1, 46, 47])
     )
+    quant_recipe = args.quant_recipe or qad_config.get("quant_recipe", "nvfp4")
     skip_inference_ckpt = getattr(args, "skip_inference_ckpt", False) or qad_config.get(
         "skip_inference_ckpt", False
     )
 
-    quant_cfg = build_quant_config(exclude_blocks=exclude_blocks)
+    quant_cfg = build_quant_config(exclude_blocks=exclude_blocks, recipe=quant_recipe)
 
     logger.info("=" * 80)
     logger.info("QAD for LTX-2 (Native LTX Trainer + ModelOpt)")
@@ -1192,6 +1381,7 @@ def main():
     logger.info(f"Output:          {config.output_dir}")
     logger.info(f"Calib size:      {calib_size}")
     logger.info(f"KD loss weight:  {kd_loss_weight}")
+    logger.info(f"Quant recipe:    {quant_recipe}")
     logger.info(f"Excluded blocks: {exclude_blocks}")
 
     trainer = LtxvQADTrainer(
@@ -1199,9 +1389,7 @@ def main():
         quant_cfg=quant_cfg,
         calib_size=calib_size,
         kd_loss_weight=kd_loss_weight,
-        evaluation_modelopt_state=(
-            args.modelopt_state if args.command == "evaluate" else None
-        ),
+        evaluation_modelopt_state=(args.modelopt_state if args.command == "evaluate" else None),
     )
 
     if args.command == "evaluate":

@@ -106,7 +106,8 @@ Edit `ltx2_qad.yaml` and set:
 - `model.text_encoder_path` – path to Gemma text encoder
 - `data.preprocessed_data_root` – path to preprocessed LTX dataset
 
-Adjust `qad` section as needed: `calib_size`, `kd_loss_weight`, `exclude_blocks`, `skip_inference_ckpt`.
+Adjust `qad` section as needed: `quant_recipe`, `calib_size`, `kd_loss_weight`,
+`exclude_blocks`, `skip_inference_ckpt`.
 
 #### Hyperparameters controllable via YAML (`ltx2_qad.yaml`)
 
@@ -114,6 +115,7 @@ All of the following can be set in `ltx2_qad.yaml`. QAD-specific options can als
 
 | Section | Key | Default (example) | Description |
 |--------|-----|--------------------|-------------|
+| **qad** | `quant_recipe` | `"nvfp4"` | Quantization recipe: `nvfp4` or `fp8`. |
 | **qad** | `calib_size` | `512` | Number of calibration batches for PTQ (more = better scale estimates, slower startup). |
 | **qad** | `kd_loss_weight` | `0.5` | Weight for distillation loss in combined loss; `0` = task loss only, `1` = distillation only. |
 | **qad** | `exclude_blocks` | `[0, 1, 46, 47]` | Transformer block indices to exclude from quantization (e.g. first/last blocks). |
@@ -133,9 +135,13 @@ Using Accelerate with the provided FSDP config:
 ```bash
 accelerate launch --config_file fsdp_custom.yaml sample_example_qad_diffusers.py train \
     --config ltx2_qad.yaml \
+    --quant-recipe fp8
 ```
 
 Checkpoints are saved under `output_dir` (e.g. `outputs/ltx2_qad/checkpoints/`) as safetensors plus optional amax and modelopt state files.
+
+The same `--quant-recipe` option applies to `evaluate`; when omitted, both commands use
+`qad.quant_recipe` from YAML, then default to `nvfp4`.
 
 ### 4. Create inference checkpoint (ComfyUI-compatible)
 
@@ -160,6 +166,21 @@ python -m ltx2.tools.ptq.checkpoint_merger \
 - **`--output`** – Output path for the ComfyUI-ready `.safetensors` file.
 
 This produces a single `.safetensors` file you can load in ComfyUI.
+
+For FP8 QAD, create an LTX-compatible merged deploy checkpoint directly:
+
+```bash
+python sample_example_qad_diffusers.py create-fp8-deploy \
+    --trained outputs/ltx2_qad/checkpoints/model_weights_step_00300.safetensors \
+    --modelopt-state outputs/ltx2_qad/checkpoints/modelopt_state_step_00300.pth \
+    --base /path/to/ltx2/checkpoint.safetensors \
+    --output outputs/ltx2_qad/ltx2_qad_fp8.safetensors
+```
+
+For PTQ step 0, pass the base BF16 checkpoint as `--trained` with
+`modelopt_state_step_00000.pth`. Selected linear weights are stored as E4M3 FP8 with scalar
+FP32 `weight_scale` and `input_scale`; excluded transformer layers remain BF16.
+`create-inference` remains the BF16 merge path.
 
 ## How it works
 

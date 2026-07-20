@@ -66,8 +66,9 @@ wandb:
   log_validation_videos: true
 
 # QAD-specific configuration (not part of LtxvTrainerConfig)
-# These can also be overridden via CLI: --calib-size, --kd-loss-weight, --exclude-blocks
+# These can also be overridden via CLI.
 qad:
+  quant_recipe: "nvfp4"  # "nvfp4" (default) or "fp8"
   calib_size: 10
   kd_loss_weight: 1.0
   exclude_blocks: [0, 1, 46, 47]
