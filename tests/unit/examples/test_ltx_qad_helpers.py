@@ -22,6 +22,8 @@ from examples.windows.diffusers.qad_example.sample_example_qad_diffusers import 
     inventory_digest,
     quantizer_inventory,
     reset_runtime_dynamic_input_amax,
+    should_run_calibration,
+    should_save_qad_checkpoint,
     summarize_amax_state,
     tensor_output_report,
     validate_calibration_counts,
@@ -117,6 +119,19 @@ def test_calibration_step_count_rejects_empty_or_nonpositive_requests():
         calibration_step_count(requested=32, dataset_size=0)
     with pytest.raises(ValueError, match="must be positive"):
         calibration_step_count(requested=0, dataset_size=8)
+
+
+def test_explicit_modelopt_state_skips_recalibration():
+    assert should_run_calibration(None)
+    assert not should_run_calibration("/tmp/a0-modelopt-state.pth")
+
+
+def test_selected_qad_checkpoint_steps():
+    selected = {1, 10, 50, 100}
+    assert should_save_qad_checkpoint(1, selected)
+    assert should_save_qad_checkpoint(100, selected)
+    assert not should_save_qad_checkpoint(2, selected)
+    assert should_save_qad_checkpoint(2, set())
 
 
 def test_summarize_amax_state_counts_finite_positive_values():

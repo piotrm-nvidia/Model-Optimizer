@@ -577,6 +577,16 @@ def calibration_step_count(requested: int, dataset_size: int) -> int:
     return requested
 
 
+def should_run_calibration(initial_modelopt_state: str | Path | None) -> bool:
+    """Calibrate only when caller did not provide an explicit PTQ state."""
+    return initial_modelopt_state is None
+
+
+def should_save_qad_checkpoint(step: int, checkpoint_steps: set[int]) -> bool:
+    """Honor selected QAD checkpoint steps when configured."""
+    return not checkpoint_steps or step in checkpoint_steps
+
+
 def apply_connectors(batch, embeddings_processor):
     """Apply the current LTX embeddings processor to precomputed features."""
     conditions = batch["conditions"]
@@ -687,6 +697,8 @@ class LtxvQADTrainer(LtxvTrainer):
         quant_cfg: dict,
         calib_size: int = 512,
         kd_loss_weight: float = 0.5,
+        initial_modelopt_state: str | Path | None = None,
+        checkpoint_steps: list[int] | None = None,
         evaluation_modelopt_state: str | Path | None = None,
         ptq_only: bool = False,
         probe_output: str | Path | None = None,
@@ -696,6 +708,10 @@ class LtxvQADTrainer(LtxvTrainer):
         self._quant_cfg = quant_cfg
         self._calib_size = calib_size
         self._kd_loss_weight = kd_loss_weight
+        self._initial_modelopt_state = (
+            Path(initial_modelopt_state) if initial_modelopt_state else None
+        )
+        self._qad_checkpoint_steps = set(checkpoint_steps or [])
         self._evaluation_modelopt_state = (
             Path(evaluation_modelopt_state) if evaluation_modelopt_state else None
         )
@@ -731,7 +747,14 @@ class LtxvQADTrainer(LtxvTrainer):
             self._capture_post_prepare_probe("restored")
             return
 
-        self._run_calibration()
+        if not should_run_calibration(self._initial_modelopt_state):
+            logger.info(f"Restoring initial PTQ state from {self._initial_modelopt_state}")
+            self._evaluation_modelopt_state = self._initial_modelopt_state
+            self._restore_ptq_state_for_evaluation()
+            self._evaluation_modelopt_state = None
+            self._transformer.to(self._accelerator.device)
+        else:
+            self._run_calibration()
         self._prepare_fixed_parity_probe()
         self._capture_pre_prepare_probe()
         if not self._ptq_only:
@@ -1181,6 +1204,10 @@ class LtxvQADTrainer(LtxvTrainer):
         if self._global_step in self._saved_qad_steps:
             logger.info(f"Checkpoint step {self._global_step} already saved; reusing it")
             return saved_weights_path
+        if not should_save_qad_checkpoint(
+            self._global_step, self._qad_checkpoint_steps
+        ):
+            return saved_weights_path
 
         self._accelerator.wait_for_everyone()
 
@@ -1520,6 +1547,11 @@ def parse_args():
         action="store_true",
         help="Skip creating inference checkpoint after training",
     )
+    train_parser.add_argument(
+        "--init-modelopt-state",
+        type=str,
+        help="Restore calibrated ModelOpt state and skip PTQ recalibration",
+    )
 
     calibrate_parser = subparsers.add_parser(
         "calibrate",
@@ -1667,6 +1699,7 @@ def main():
     skip_inference_ckpt = getattr(args, "skip_inference_ckpt", False) or qad_config.get(
         "skip_inference_ckpt", False
     )
+    checkpoint_steps = qad_config.get("checkpoint_steps")
 
     quant_cfg = build_quant_config(exclude_blocks=exclude_blocks)
 
@@ -1680,12 +1713,17 @@ def main():
     logger.info(f"Calib size:      {calib_size}")
     logger.info(f"KD loss weight:  {kd_loss_weight}")
     logger.info(f"Excluded blocks: {exclude_blocks}")
+    logger.info(
+        f"Initial PTQ:     {getattr(args, 'init_modelopt_state', None) or 'calibrate in this run'}"
+    )
 
     trainer = LtxvQADTrainer(
         trainer_config=config,
         quant_cfg=quant_cfg,
         calib_size=calib_size,
         kd_loss_weight=kd_loss_weight,
+        initial_modelopt_state=getattr(args, "init_modelopt_state", None),
+        checkpoint_steps=checkpoint_steps,
         evaluation_modelopt_state=(
             args.modelopt_state if args.command in {"evaluate", "parity-probe"} else None
         ),
