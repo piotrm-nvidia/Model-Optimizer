@@ -307,15 +307,17 @@ def test_enrich_modelopt_state_with_template_overlays_amax_digests():
     set_quantizer_state_dict(
         legacy_model,
         {
-            "enabled_input_quantizer._amax": torch.tensor(2.0),
-            "enabled_weight_quantizer._amax": torch.tensor(9.0),
-            "disabled_input_quantizer._amax": torch.tensor(float("nan")),
+            "enabled_input_quantizer": {"_amax": torch.tensor(2.0)},
+            "enabled_weight_quantizer": {"_amax": torch.tensor(9.0)},
+            "disabled_input_quantizer": {"_amax": torch.tensor(float("nan"))},
         },
     )
     legacy = {
         "modelopt_version": "legacy",
         "modelopt_state_weights": get_quantizer_state_dict(legacy_model),
     }
+    assert isinstance(legacy["modelopt_state_weights"]["enabled_weight_quantizer"], dict)
+    assert "_amax" in legacy["modelopt_state_weights"]["enabled_weight_quantizer"]
 
     enrich_modelopt_state_with_template(legacy, template["quantizer_inventory"])
 

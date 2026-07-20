@@ -442,6 +442,9 @@ def enrich_modelopt_state_with_template(
     Used to re-save legacy QAD checkpoints that omitted inventory metadata.
     Amax digests come from ``modelopt_state_weights``; enable/config come from
     the corrected PTQ template inventory (typically A0).
+
+    ``modelopt_state_weights`` maps quantizer FQN -> OrderedDict that may contain
+    an ``_amax`` tensor (ModelOpt ``get_quantizer_state_dict`` format).
     """
     weights = state.get("modelopt_state_weights")
     if not isinstance(weights, dict) or not weights:
@@ -449,8 +452,14 @@ def enrich_modelopt_state_with_template(
 
     amax_by_fqn: dict[str, torch.Tensor] = {}
     for key, value in weights.items():
-        if isinstance(value, torch.Tensor) and key.endswith("._amax"):
-            amax_by_fqn[key[: -len("._amax")]] = value
+        if isinstance(value, torch.Tensor) and str(key).endswith("._amax"):
+            # Flat legacy key form, if ever present.
+            amax_by_fqn[str(key)[: -len("._amax")]] = value
+            continue
+        if isinstance(value, dict):
+            amax = value.get("_amax")
+            if isinstance(amax, torch.Tensor):
+                amax_by_fqn[str(key)] = amax
 
     inventory = []
     for item in template_inventory:
