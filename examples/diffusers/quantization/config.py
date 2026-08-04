@@ -40,6 +40,30 @@ INT8_DEFAULT_CONFIG = {
     "algorithm": "max",
 }
 
+# W8A8 with per-output-channel weights and per-token dynamic activations. Dynamic
+# activation scales are computed at runtime from each token's own range, so there is
+# nothing to calibrate on the activation side and no SmoothQuant migration to tune,
+# which makes this a clean comparison arm against static SmoothQuant INT8. Mirrors the
+# core FP8_PER_CHANNEL_PER_TOKEN_CFG spelling
+# (modelopt/torch/quantization/config.py) with num_bits 8.
+#
+# axis 0 on the weight quantizer is required, not cosmetic: the real-INT8 exporter's
+# to_quantized_weight indexes the scale as [:, None], so a per-tensor weight scale would
+# make --hf-ckpt-dir export unusable and the checkpoint-byte deliverable unmeasurable.
+INT8_PER_CHANNEL_PER_TOKEN_CONFIG = {
+    "quant_cfg": {
+        "*weight_quantizer": {"num_bits": 8, "axis": 0},
+        "*input_quantizer": {
+            "num_bits": 8,
+            "type": "dynamic",
+            "block_sizes": {-1: None},
+        },
+        "*output_quantizer": {"enable": False},
+        "default": {"enable": False},
+    },
+    "algorithm": "max",
+}
+
 NVFP4_DEFAULT_CONFIG = {
     "quant_cfg": {
         "*weight_quantizer": {
