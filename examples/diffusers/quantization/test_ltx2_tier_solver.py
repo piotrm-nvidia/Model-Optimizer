@@ -101,9 +101,30 @@ class FakeTextEmbeddingProjection(nn.Module):
         self.audio_aggregate_embed = nn.Linear(TEXT_DIM * layers, AUDIO_DIM, bias=False)
 
 
+class FakeConnectorBlock(nn.Module):
+    """Connector blocks are self-attention plus FFN only, with no cross-attention."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.attn1 = FakeAttention(dim, dim)
+        self.ff = FakeFeedForward(dim)
+
+
+class FakeEmbeddingsConnector(nn.Module):
+    """Note transformer_1d_blocks, not transformer_blocks: a different index spelling."""
+
+    def __init__(self, dim: int, blocks: int = 3):
+        super().__init__()
+        self.transformer_1d_blocks = nn.ModuleList(
+            [FakeConnectorBlock(dim) for _ in range(blocks)]
+        )
+
+
 class FakeLtx2(nn.Module):
     def __init__(self):
         super().__init__()
+        self.video_embeddings_connector = FakeEmbeddingsConnector(VIDEO_DIM)
+        self.audio_embeddings_connector = FakeEmbeddingsConnector(AUDIO_DIM)
         self.patchify_proj = nn.Linear(VIDEO_DIM, VIDEO_DIM, bias=False)
         self.audio_patchify_proj = nn.Linear(AUDIO_DIM, AUDIO_DIM, bias=False)
         self.text_embedding_projection = FakeTextEmbeddingProjection()
@@ -179,6 +200,31 @@ def test_the_text_embedding_projection_is_base_protected():
         assert entry.tokens == TEXT_TOKENS
 
 
+def test_embeddings_connectors_are_a_separate_stack_on_the_text_path():
+    inventory, _ = _inventory()
+    entries = _by_name(inventory)
+
+    ffn = entries["video_embeddings_connector.transformer_1d_blocks.1.ff.net.2"]
+    assert ffn.layer_class == "conn_ffn_down"
+    # transformer_1d_blocks.N must parse, or no block-ramp step can reach it.
+    assert ffn.block == 1
+    # Self-attention over the text embedding sequence, whichever stream it feeds.
+    assert ffn.tokens == TEXT_TOKENS
+    assert entries["audio_embeddings_connector.transformer_1d_blocks.0.attn1.to_q"].tokens == (
+        TEXT_TOKENS
+    )
+
+    # Connector indices must not be confused with the main stack's, or protecting
+    # connector block 1 would also claim backbone block 1.
+    main = entries["transformer_blocks.1.ff.net.2"]
+    assert main.layer_class == "ffn_down"
+    assert main.block == 1
+    protection = solve_protection(inventory, 0.0)["protection"]
+    conn_blocks = protection.partial.get("conn_ffn_down", set())
+    assert protection.protects(ffn)
+    assert conn_blocks <= {0, 1, 2}, "connector blocks must live in their own namespace"
+
+
 def test_conditioning_and_io_are_named_rather_than_left_as_other():
     inventory, _ = _inventory()
     entries = _by_name(inventory)
@@ -218,6 +264,23 @@ def test_target_one_adds_nothing_and_zero_protects_everything():
     bottom = solve_protection(inventory, 0.0)
     assert bottom["vram_saving_retained"] < 0.05
     assert bottom["latency_saving_retained"] < 0.05
+
+
+def test_target_zero_leaves_no_module_unprotectable():
+    """Every quantizable module must be reachable by some step of the walk.
+
+    A module the walk can never select is quantized at every target while contributing
+    nothing to the ladder - which is what happened to the embeddings connectors, whose
+    block index did not parse, so no block-ramp step could ever pick them.
+    """
+    inventory, _ = _inventory()
+    protection = solve_protection(inventory, 0.0)["protection"]
+    unreachable = [
+        entry.name
+        for entry in inventory
+        if not entry.always_protected and not protection.protects(entry)
+    ]
+    assert not unreachable, f"unprotectable at target 0.0: {unreachable[:5]}"
 
 
 def test_savings_fall_monotonically_as_the_target_falls():

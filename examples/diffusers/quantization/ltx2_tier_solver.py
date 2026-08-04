@@ -140,7 +140,20 @@ BASE_PROTECT_PATTERN = re.compile(
     r"|patchify_proj|adaln_single).*"
 )
 
-_BLOCK_RE = re.compile(r"transformer_blocks\.(\d+)\.")
+# Matches the main stack's transformer_blocks.N and the embeddings connectors'
+# transformer_1d_blocks.N. Connector blocks get the conn_ class prefix below, so their
+# indices live in a separate class namespace and cannot collide with the main stack's.
+#
+# Missing the connectors here was not merely cosmetic: a module whose block index does not
+# parse cannot be selected by a block-ramp step, so the 112 connector modules were
+# unprotectable at every target while still being quantized.
+_BLOCK_RE = re.compile(r"transformer(?:_1d)?_blocks\.(\d+)\.")
+
+# video_embeddings_connector / audio_embeddings_connector are 8-block self-attention stacks
+# that sit on the text-conditioning path, after text_embedding_projection and before the
+# blocks cross-attend to their output. They are inside the quantized backbone - about
+# 4 GiB at full width - so they are not "outside the model" as their placement suggests.
+_CONNECTOR_MARKER = "embeddings_connector"
 
 # How fragile each layer class is expected to be under a uniform INT8 grid. This is a
 # PRIOR, not a measurement: it encodes that a heads-wide gate tensor decides whether a
@@ -152,8 +165,18 @@ SENSITIVITY_PRIOR: dict[str, float] = {
     "attn_gate": 10.0,
     "xmodal_attn_gate": 10.0,
     "audio_attn_gate": 10.0,
+    "conn_attn_gate": 10.0,
     "ffn_down": 9.0,
     "audio_ffn_down": 9.0,
+    # The connectors encode the conditioning every block cross-attends to, so an error
+    # here is not local to one block; they are also only 8 blocks deep, which limits how
+    # much of the saving protecting them can cost.
+    "conn_ffn_down": 9.5,
+    "conn_attn_out": 7.0,
+    "conn_ffn_up": 6.5,
+    "conn_attn_k": 6.0,
+    "conn_attn_v": 6.0,
+    "conn_attn_q": 5.0,
     "xmodal_attn_k": 6.0,
     "xmodal_attn_v": 6.0,
     "xmodal_attn_q": 5.5,
@@ -224,15 +247,22 @@ def classify(name: str, out_features: int, in_features: int, tokens: TokenGeomet
             layer_class, stream = "attn_gate", query_stream
         else:
             layer_class, stream = "attn_other", query_stream
-        if container in ("audio_to_video_attn", "video_to_audio_attn"):
+        if _CONNECTOR_MARKER in name:
+            # Self-attention over the text embedding sequence, so the stream is text
+            # regardless of which connector it feeds.
+            layer_class, stream = f"conn_{layer_class}", "text"
+        elif container in ("audio_to_video_attn", "video_to_audio_attn"):
             layer_class = f"xmodal_{layer_class}"
         elif container.startswith("audio_"):
             layer_class = f"audio_{layer_class}"
     elif "ff.net." in name:
-        stream = "audio" if "audio_ff" in name else "video"
         layer_class = "ffn_up" if ".net.0" in name else "ffn_down"
-        if stream == "audio":
-            layer_class = f"audio_{layer_class}"
+        if _CONNECTOR_MARKER in name:
+            layer_class, stream = f"conn_{layer_class}", "text"
+        elif "audio_ff" in name:
+            layer_class, stream = f"audio_{layer_class}", "audio"
+        else:
+            stream = "video"
     elif "adaln" in name or "time_embed" in name or ".emb." in name:
         # The timestep and adaLN conditioning path runs once per denoise step, not once
         # per token, so a token-count of 1 keeps it from dominating the FLOP totals on
