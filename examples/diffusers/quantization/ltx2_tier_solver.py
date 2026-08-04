@@ -125,10 +125,19 @@ ATTENTION_STREAMS = {
 }
 
 # Modules kept in high precision at every tier: embeddings, the timestep / adaLN
-# conditioning path, patchify, and the output projection. Identical to the set
-# filter_func_ltx_video already protects, so a target of 1.0 reproduces stock behaviour.
+# conditioning path, patchify, and the output projection.
+#
+# This is filter_func_ltx_video's set plus text_embedding_projection, which is a
+# correction rather than an addition. That filter protects caption_projection, but
+# LTX-2.3 has no module by that name: the text-embedding path is spelled
+# text_embedding_projection.{video,audio}_aggregate_embed. Those two are 4096x188160 and
+# 2048x188160 - about 2.3 GiB, ~5.6% of the linear weight bytes - and they consume
+# concatenated per-layer text-encoder hidden states, whose per-input dynamic ranges differ
+# by orders of magnitude and so are a poor fit for one shared activation scale. Left
+# unprotected they are quantized while the filter's own intent says they should not be.
 BASE_PROTECT_PATTERN = re.compile(
-    r".*(proj_in|time_embed|caption_projection|proj_out|patchify_proj|adaln_single).*"
+    r".*(proj_in|time_embed|caption_projection|text_embedding_projection|proj_out"
+    r"|patchify_proj|adaln_single).*"
 )
 
 _BLOCK_RE = re.compile(r"transformer_blocks\.(\d+)\.")
@@ -224,13 +233,21 @@ def classify(name: str, out_features: int, in_features: int, tokens: TokenGeomet
         layer_class = "ffn_up" if ".net.0" in name else "ffn_down"
         if stream == "audio":
             layer_class = f"audio_{layer_class}"
-    else:
+    elif "adaln" in name or "time_embed" in name or ".emb." in name:
+        # The timestep and adaLN conditioning path runs once per denoise step, not once
+        # per token, so a token-count of 1 keeps it from dominating the FLOP totals on
+        # the strength of its 36864x4096 output projection.
+        layer_class, stream = "conditioning", "single"
+    elif "text_embedding_projection" in name or "caption_projection" in name:
+        # Consumes text-encoder hidden states, so it is priced at text tokens even though
+        # its output feeds the video or audio stream.
+        layer_class, stream = "text_embed_proj", "text"
+    elif "patchify_proj" in name or "proj_out" in name or "proj_in" in name:
+        layer_class = "io_proj"
         stream = "audio" if "audio_" in name else "video"
-        if "caption_projection" in name:
-            stream = "text"
-        elif "adaln" in name or "time_embed" in name or "emb." in name:
-            # Conditioning is computed once per timestep, not once per token.
-            stream = "single"
+    else:
+        layer_class = "other"
+        stream = "audio" if "audio_" in name else "video"
 
     token_map = {
         "video": tokens.video,

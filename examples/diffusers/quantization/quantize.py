@@ -618,7 +618,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Solve an LTX-2 protection tier that retains this fraction of the achievable "
-            "saving on --ltx-protect-metric (1.0 protects only the default set, 0.0 keeps "
+            "saving on --ltx-protect-metric (1.0 protects only the base set, 0.0 keeps "
             "everything in high precision). Solved against the live module tree, so the "
             "tier's predicted cost is reported before calibration starts."
         ),

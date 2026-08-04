@@ -32,6 +32,7 @@ import torch
 from ltx2_tier_solver import (
     BF16_BYTES,
     SENSITIVITY_PRIOR,
+    TEXT_TOKENS,
     TokenGeometry,
     build_inventory_from_model,
     cost_of,
@@ -87,12 +88,25 @@ class FakeBlock(nn.Module):
         self.video_to_audio_attn = FakeAttention(AUDIO_DIM, VIDEO_DIM)
 
 
+class FakeTextEmbeddingProjection(nn.Module):
+    """LTX-2.3's text path: an aggregation over concatenated encoder hidden states.
+
+    Deliberately wide on the input side, as in the real checkpoint, where these are the
+    two largest single Linear weights outside the blocks.
+    """
+
+    def __init__(self, layers: int = 8):
+        super().__init__()
+        self.video_aggregate_embed = nn.Linear(TEXT_DIM * layers, VIDEO_DIM, bias=False)
+        self.audio_aggregate_embed = nn.Linear(TEXT_DIM * layers, AUDIO_DIM, bias=False)
+
+
 class FakeLtx2(nn.Module):
     def __init__(self):
         super().__init__()
         self.patchify_proj = nn.Linear(VIDEO_DIM, VIDEO_DIM, bias=False)
         self.audio_patchify_proj = nn.Linear(AUDIO_DIM, AUDIO_DIM, bias=False)
-        self.caption_projection = nn.Linear(TEXT_DIM, VIDEO_DIM, bias=False)
+        self.text_embedding_projection = FakeTextEmbeddingProjection()
         self.adaln_single = nn.Linear(VIDEO_DIM, 6 * VIDEO_DIM, bias=False)
         self.transformer_blocks = nn.ModuleList([FakeBlock() for _ in range(N_BLOCKS)])
         self.proj_out = nn.Linear(VIDEO_DIM, VIDEO_DIM, bias=False)
@@ -148,10 +162,38 @@ def test_token_counts_follow_the_stream_that_supplies_the_tensor():
     assert entries["adaln_single"].tokens == 1
 
 
+def test_the_text_embedding_projection_is_base_protected():
+    """The stock filter protects caption_projection, which LTX-2.3 does not have.
+
+    Its role is taken by text_embedding_projection, whose two aggregation weights are
+    among the largest in the model and consume concatenated encoder hidden states. If
+    this regresses, the "as-is" arm silently quantizes the text path.
+    """
+    inventory, _ = _inventory()
+    entries = _by_name(inventory)
+    for leaf in ("video_aggregate_embed", "audio_aggregate_embed"):
+        entry = entries[f"text_embedding_projection.{leaf}"]
+        assert entry.always_protected
+        assert entry.layer_class == "text_embed_proj"
+        # Priced at text tokens: it reads encoder hidden states, whichever stream it feeds.
+        assert entry.tokens == TEXT_TOKENS
+
+
+def test_conditioning_and_io_are_named_rather_than_left_as_other():
+    inventory, _ = _inventory()
+    entries = _by_name(inventory)
+    assert entries["adaln_single"].layer_class == "conditioning"
+    assert entries["patchify_proj"].layer_class == "io_proj"
+    assert entries["proj_out"].layer_class == "io_proj"
+    # Anything still in "other" carries cost under a default sensitivity, so the real
+    # checkpoint should leave nothing there.
+    assert not [entry for entry in inventory if entry.layer_class == "other"]
+
+
 def test_base_set_is_protected_at_every_target():
     inventory, tokens = _inventory()
     always = {entry.name for entry in inventory if entry.always_protected}
-    assert {"patchify_proj", "audio_patchify_proj", "caption_projection", "adaln_single", "proj_out"} <= always
+    assert {"patchify_proj", "audio_patchify_proj", "adaln_single", "proj_out"} <= always
 
     for target in (1.0, 0.75, 0.5, 0.25, 0.0):
         names = set(solve_protection(inventory, target)["protection"].module_names(inventory))
@@ -164,7 +206,8 @@ def test_base_set_is_protected_at_every_target():
         assert names <= {entry.name for entry in inventory}
 
 
-def test_target_one_reproduces_the_stock_filter_and_zero_protects_everything():
+def test_target_one_adds_nothing_and_zero_protects_everything():
+    """A target of 1.0 must leave the base set alone and protect nothing on top of it."""
     inventory, _ = _inventory()
     floor = cost_of(inventory, lambda entry: False)
 
