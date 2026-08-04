@@ -619,7 +619,15 @@ def main() -> int:
         "--out-dir",
         type=Path,
         default=None,
-        help="Write tier_targets.json and protect_<target>.json here",
+        help=(
+            "Write tier_targets.json, linear_inventory.json and protect_<target>.json here. "
+            "The inventory is what quant_cost_report reads to attribute FLOPs per module."
+        ),
+    )
+    parser.add_argument(
+        "--show-class",
+        default=None,
+        help="Print the module names in one layer class, to check a classification by eye",
     )
     args = parser.parse_args()
 
@@ -644,6 +652,17 @@ def main() -> int:
             f"{row['flop_share']:>12.4f}{row['byte_share']:>12.4f}"
         )
     print()
+
+    if args.show_class:
+        shown = [entry for entry in inventory if entry.layer_class == args.show_class]
+        print(f"{len(shown)} modules in class {args.show_class!r}:")
+        for entry in sorted(shown, key=lambda e: -e.numel):
+            flag = "base-protected" if entry.always_protected else "quantizable"
+            print(
+                f"  {entry.name:<64} {entry.out_features:>6} x {entry.in_features:<6} "
+                f"tokens={entry.tokens:<6} {flag}"
+            )
+        print()
 
     targets = [float(t) for t in args.targets.split(",")]
     records = []
@@ -672,6 +691,30 @@ def main() -> int:
             )
 
     if args.out_dir:
+        args.out_dir.mkdir(parents=True, exist_ok=True)
+        (args.out_dir / "linear_inventory.json").write_text(
+            json.dumps(
+                {
+                    "checkpoint": str(args.safetensors),
+                    "tokens": tokens.as_dict(),
+                    "modules": [
+                        {
+                            "name": entry.name,
+                            "out_features": entry.out_features,
+                            "in_features": entry.in_features,
+                            "block": entry.block,
+                            "layer_class": entry.layer_class,
+                            "tokens": entry.tokens,
+                            "flops": entry.flops,
+                            "always_protected": entry.always_protected,
+                        }
+                        for entry in inventory
+                    ],
+                },
+                indent=2,
+            )
+            + "\n"
+        )
         (args.out_dir / "tier_targets.json").write_text(
             json.dumps(
                 {
