@@ -219,8 +219,6 @@ class PipelineManager:
 
         if not checkpoint_path:
             raise ValueError("Missing required extra_param: checkpoint_path.")
-        if not distilled_lora_path:
-            raise ValueError("Missing required extra_param: distilled_lora_path.")
         if not spatial_upsampler_path:
             raise ValueError("Missing required extra_param: spatial_upsampler_path.")
         if not gemma_root:
@@ -230,13 +228,24 @@ class PipelineManager:
         from ltx_core.quantization import QuantizationPolicy
         from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
-        distilled_lora = [
-            LoraPathStrengthAndSDOps(
-                str(distilled_lora_path),
-                float(distilled_lora_strength),
-                LTXV_LORA_COMFY_RENAMING_MAP,
+        # Optional: a checkpoint that already has the distilled LoRA fused in must not
+        # have it applied a second time, so an absent distilled_lora_path means "the
+        # base weights are already distilled" rather than a misconfiguration.
+        distilled_lora = (
+            [
+                LoraPathStrengthAndSDOps(
+                    str(distilled_lora_path),
+                    float(distilled_lora_strength),
+                    LTXV_LORA_COMFY_RENAMING_MAP,
+                )
+            ]
+            if distilled_lora_path
+            else []
+        )
+        if not distilled_lora_path:
+            self.logger.info(
+                "No distilled_lora_path given; assuming the checkpoint is already distilled."
             )
-        ]
         pipeline_kwargs = {
             "checkpoint_path": str(checkpoint_path),
             "distilled_lora": distilled_lora,

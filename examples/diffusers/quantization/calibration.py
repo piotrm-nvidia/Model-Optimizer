@@ -126,6 +126,13 @@ class Calibrator:
             DEFAULT_VIDEO_GUIDER_PARAMS,
         )
 
+        # The LTX-2 pipeline takes a single prompt, so a batch larger than one would have
+        # its remaining prompts silently dropped and the run would quietly calibrate on
+        # fewer samples than requested.
+        assert len(prompt_batch) == 1, (
+            f"LTX-2 calibration consumes one prompt per call but got {len(prompt_batch)}. "
+            "Use --batch-size 1 so calib_size counts actual calibration samples."
+        )
         prompt = prompt_batch[0]
         extra_params = self.pipeline_manager.config.extra_params
         kwargs = {
