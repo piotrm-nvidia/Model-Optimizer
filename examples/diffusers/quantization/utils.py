@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import re
 from pathlib import Path
@@ -73,6 +74,50 @@ def filter_func_ltx_video(name: str) -> bool:
         r".*(proj_in|time_embed|caption_projection|proj_out|patchify_proj|adaln_single).*"
     )
     return pattern.match(name) is not None
+
+
+def build_filter_func_from_names(names: list[str]):
+    """Build a protection filter from an explicit set of module names.
+
+    Exact matching, because this consumes solved or recorded protection sets where a
+    substring match could silently widen the set beyond what was costed.
+    """
+    protected = set(names)
+
+    def filter_func(name: str) -> bool:
+        return name in protected
+
+    return filter_func
+
+
+def build_filter_func_from_json(path: str | Path):
+    """Build a protection filter from a JSON protection list.
+
+    The file is either a JSON list of patterns or an object with a ``protect`` key
+    holding that list. An empty list protects nothing.
+
+    Matching is exact by default, so replaying a solved or sensitivity-derived tier
+    protects exactly the modules that were costed and nothing else. Set ``"match":
+    "substring"`` in the object form to write coarse patterns like ``ff.net.2`` by hand.
+    """
+    payload = json.loads(Path(path).read_text())
+    patterns = payload["protect"] if isinstance(payload, dict) else payload
+    match = payload.get("match", "exact") if isinstance(payload, dict) else "exact"
+    if not isinstance(patterns, list):
+        raise ValueError(f"Protection list in {path} must be a JSON list of patterns.")
+    if match not in ("exact", "substring"):
+        raise ValueError(f"Protection list in {path} has unknown match mode {match!r}.")
+    if match == "exact":
+        return build_filter_func_from_names([str(p) for p in patterns])
+    literals = [re.escape(str(p)) for p in patterns]
+    if not literals:
+        return lambda name: False
+    pattern = re.compile(r".*(" + "|".join(literals) + r").*")
+
+    def filter_func(name: str) -> bool:
+        return pattern.match(name) is not None
+
+    return filter_func
 
 
 def filter_func_flux_dev(name: str) -> bool:

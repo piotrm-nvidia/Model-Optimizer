@@ -56,6 +56,19 @@ class QuantAlgo(str, Enum):
     SMOOTHQUANT = "smoothquant"
 
 
+class Int8Numerics(str, Enum):
+    """Activation numerics for the INT8 format.
+
+    STATIC keeps the stock behaviour: per-tensor activation amax collected during
+    calibration, optionally after a SmoothQuant migration. PER_TOKEN_DYNAMIC computes
+    an activation scale per token at runtime, so nothing is calibrated on the
+    activation side.
+    """
+
+    STATIC = "static"
+    PER_TOKEN_DYNAMIC = "per_token_dynamic"
+
+
 class CollectMethod(str, Enum):
     """Calibration collection methods."""
 
@@ -77,7 +90,25 @@ class QuantizationConfig:
     alpha: float = 1.0  # SmoothQuant alpha
     lowrank: int = 32  # SVDQuant lowrank
     quantize_mha: bool = False
+    # INT8 is allowed here. The core library supports INT8 real quantization
+    # (TensorQuantizer._is_real_quantize_support accepts num_bits 8 and dispatches to
+    # INT8QTensor), so compression is what makes peak VRAM reflect int8 weight residency
+    # instead of a fake-quant BF16 copy. No INT8 GEMM backend is registered, so the
+    # forward still dequantizes to BF16 and warns; that costs speed, not correctness.
     compress: bool = False
+    int8_numerics: Int8Numerics = Int8Numerics.STATIC
+    # Which modules to keep in high precision. A cost target has the tier solved against
+    # the loaded model (see ltx2_tier_solver); a JSON path supplies an explicit module
+    # list and wins over the target, which is how a solved tier is replayed and how a
+    # sensitivity-derived protection set is fed back in.
+    ltx_protect_target: float | None = None
+    ltx_protect_metric: str = "vram"
+    protect_from_json: Path | None = None
+    # AutoQuantize search, as an alternative to a declared protection set.
+    auto_quantize: bool = False
+    effective_bits: float = 8.4
+    auto_quantize_method: str = "kl_div"
+    auto_quantize_checkpoint: Path | None = None
 
     def validate(self) -> None:
         """Validate configuration consistency."""
@@ -85,8 +116,36 @@ class QuantizationConfig:
             raise NotImplementedError("Only 'default' collect method is implemented for FP8.")
         if self.quantize_mha and self.format == QuantFormat.INT8:
             raise ValueError("MHA quantization is only supported for FP8, not INT8.")
-        if self.compress and self.format == QuantFormat.INT8:
-            raise ValueError("Compression is only supported for FP8 and FP4, not INT8.")
+        if self.int8_numerics == Int8Numerics.PER_TOKEN_DYNAMIC:
+            if self.format != QuantFormat.INT8:
+                raise ValueError("--int8-numerics only applies to --format int8.")
+            if self.algo == QuantAlgo.SMOOTHQUANT:
+                raise ValueError(
+                    "Per-token dynamic activations and SmoothQuant are mutually exclusive: "
+                    "there is no static activation range left to migrate into the weights."
+                )
+        if self.protect_from_json is not None and not self.protect_from_json.exists():
+            raise FileNotFoundError(f"Protection list not found: {self.protect_from_json}")
+        if self.ltx_protect_target is not None:
+            if not 0.0 <= self.ltx_protect_target <= 1.0:
+                raise ValueError(
+                    f"--ltx-protect-target is a retained saving fraction and must be in "
+                    f"[0, 1], got {self.ltx_protect_target}."
+                )
+            if self.protect_from_json is not None:
+                raise ValueError(
+                    "Pass either --ltx-protect-target to solve a tier or --protect-from-json "
+                    "to pin one, not both."
+                )
+        if self.auto_quantize and (
+            self.ltx_protect_target is not None or self.protect_from_json is not None
+        ):
+            raise ValueError(
+                "--auto-quantize searches for its own per-layer assignment; do not also "
+                "pin a protection tier or list."
+            )
+        if not 0 < self.effective_bits <= 16:
+            raise ValueError("--effective-bits must be in (0, 16].")
 
 
 @dataclass

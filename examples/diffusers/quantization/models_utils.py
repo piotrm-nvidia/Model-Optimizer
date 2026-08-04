@@ -16,6 +16,7 @@
 import logging
 from collections.abc import Callable
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from diffusers import (
@@ -26,6 +27,8 @@ from diffusers import (
     WanPipeline,
 )
 from utils import (
+    build_filter_func_from_json,
+    build_filter_func_from_names,
     filter_func_default,
     filter_func_flux_dev,
     filter_func_ltx_video,
@@ -48,16 +51,31 @@ class ModelType(str, Enum):
     WAN22_T2V_5b = "wan2.2-t2v-5b"
 
 
-def get_model_filter_func(model_type: ModelType) -> Callable[[str], bool]:
+def get_model_filter_func(
+    model_type: ModelType,
+    protect_names: list[str] | None = None,
+    protect_from_json: str | Path | None = None,
+) -> Callable[[str], bool]:
     """
     Get the appropriate filter function for a given model type.
 
     Args:
         model_type: The model type enum
+        protect_names: Explicit module names to keep in high precision, as produced by
+            the cost-target tier solver. Takes precedence over the per-model default.
+        protect_from_json: Path to a recorded protection list, which takes precedence
+            over everything else. Used to replay a solved tier or to apply a
+            sensitivity-derived set.
 
     Returns:
         A filter function appropriate for the model type
     """
+    if protect_from_json is not None:
+        return build_filter_func_from_json(protect_from_json)
+
+    if protect_names is not None:
+        return build_filter_func_from_names(protect_names)
+
     filter_func_map = {
         ModelType.FLUX_DEV: filter_func_flux_dev,
         ModelType.FLUX_SCHNELL: filter_func_default,
@@ -208,6 +226,23 @@ MODEL_DEFAULTS: dict[ModelType, dict[str, Any]] = {
         },
     },
 }
+
+
+def resolve_clip_geometry(
+    model_type: ModelType, extra_params: dict[str, Any]
+) -> tuple[int, int, int, float]:
+    """Resolve (height, width, frames, fps) for the clip a model will actually generate.
+
+    Same precedence the calibration loop uses - explicit extra_params first, then the
+    per-model inference defaults - so a tier solved from this geometry is solved for the
+    clip shape that is about to be calibrated and generated, not a nominal one.
+    """
+    defaults = MODEL_DEFAULTS.get(model_type, {}).get("inference_extra_args", {})
+    height = extra_params.get("height", defaults.get("height", 768))
+    width = extra_params.get("width", defaults.get("width", 1280))
+    frames = extra_params.get("num_frames", defaults.get("num_frames", 121))
+    fps = extra_params.get("frame_rate", defaults.get("frame_rate", 24.0))
+    return int(height), int(width), int(frames), float(fps)
 
 
 def _coerce_extra_param_value(value: str) -> Any:

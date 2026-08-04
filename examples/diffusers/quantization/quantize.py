@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import argparse
+import copy
+import json
 import logging
 import sys
 import time as time
@@ -25,20 +27,30 @@ from calibration import Calibrator
 from config import (
     FP8_DEFAULT_CONFIG,
     INT8_DEFAULT_CONFIG,
+    INT8_PER_CHANNEL_PER_TOKEN_CONFIG,
     NVFP4_DEFAULT_CONFIG,
     NVFP4_FP8_MHA_CONFIG,
     reset_set_int8_config,
     set_quant_config_attr,
 )
 from diffusers import DiffusionPipeline
-from models_utils import MODEL_DEFAULTS, ModelType, get_model_filter_func, parse_extra_params
+from ltx2_tier_solver import METRICS, TokenGeometry, solve_protection_from_model
+from models_utils import (
+    MODEL_DEFAULTS,
+    ModelType,
+    get_model_filter_func,
+    parse_extra_params,
+    resolve_clip_geometry,
+)
 from onnx_utils.export import generate_fp8_scales, modelopt_export_sd
 from pipeline_manager import PipelineManager
+from quant_cost_report import write_quant_cost_report
 from quantize_config import (
     CalibrationConfig,
     CollectMethod,
     DataType,
     ExportConfig,
+    Int8Numerics,
     ModelConfig,
     QuantAlgo,
     QuantFormat,
@@ -84,6 +96,19 @@ def setup_logging(verbose: bool = False) -> logging.Logger:
     return logger
 
 
+def _jsonable(value: Any) -> Any:
+    """Best-effort conversion of a search state into something JSON can hold."""
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, torch.Tensor):
+        return value.detach().float().cpu().tolist()
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
 class Quantizer:
     """Handles model quantization operations."""
 
@@ -101,6 +126,61 @@ class Quantizer:
         self.config = config
         self.model_config = model_config
         self.logger = logger
+        # Populated by solve_protection_tier when a cost target is given.
+        self.protect_names: list[str] | None = None
+        self.protect_report: dict[str, Any] | None = None
+
+    def solve_protection_tier(
+        self, backbone: torch.nn.Module, extra_params: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Solve the protection tier for a cost target, against this loaded backbone.
+
+        Called before calibration so the tier's predicted VRAM and projected latency are
+        on record, and a target that lands somewhere unintended fails before a calibration
+        pass is spent on it. Returns the cost report, or None when no target was given.
+        """
+        if self.config.ltx_protect_target is None:
+            return None
+        if self.model_config.model_type != ModelType.LTX2:
+            raise ValueError(
+                f"--ltx-protect-target only applies to {ModelType.LTX2.value}, "
+                f"not {self.model_config.model_type.value}."
+            )
+
+        height, width, frames, fps = resolve_clip_geometry(
+            self.model_config.model_type, extra_params
+        )
+        tokens = TokenGeometry.for_clip(height, width, frames, fps)
+        self.protect_names, self.protect_report = solve_protection_from_model(
+            backbone,
+            self.config.ltx_protect_target,
+            tokens,
+            metric=self.config.ltx_protect_metric,
+        )
+        self.protect_report["clip_geometry"] = {
+            "height": height,
+            "width": width,
+            "num_frames": frames,
+            "frame_rate": fps,
+        }
+        report = self.protect_report
+        self.logger.info(
+            f"Solved protection tier on the {report['metric']} axis: "
+            f"target {report['target']:.2f}, achieved {report['achieved_saving_retained']:.3f}, "
+            f"stopped after {report['last_step']}"
+        )
+        self.logger.info(
+            f"Tier keeps {report['measured']['protected_modules']} modules in high precision "
+            f"and quantizes {report['measured']['quantized_modules']}; linear weights "
+            f"{report['measured']['weight_gib_bf16']:.2f} -> "
+            f"{report['measured']['weight_gib_tiered']:.2f} GiB "
+            f"({report['measured']['effective_bits']:.2f} effective bits)"
+        )
+        self.logger.info(
+            f"Projected (upper bound) A100 speedup {report['projected']['speedup_a100']:.3f}x "
+            f"at a {report['projected']['gemm_time_share_assumed']:.2f} GEMM time share"
+        )
+        return report
 
     def get_quant_config(self, n_steps: int, backbone: torch.nn.Module) -> Any:
         """
@@ -115,10 +195,19 @@ class Quantizer:
         self.logger.info(f"Building quantization config for {self.config.format.value}")
 
         if self.config.format == QuantFormat.INT8:
-            if self.config.algo == QuantAlgo.SMOOTHQUANT:
-                quant_config = mtq.INT8_SMOOTHQUANT_CFG
+            if self.config.int8_numerics == Int8Numerics.PER_TOKEN_DYNAMIC:
+                quant_config = copy.deepcopy(INT8_PER_CHANNEL_PER_TOKEN_CONFIG)
+            elif self.config.algo == QuantAlgo.SMOOTHQUANT:
+                # Deep-copied because set_quant_config_attr mutates in place and this is
+                # the process-wide mtq singleton; the previous aliasing meant a second
+                # get_quant_config call in one process saw the first call's edits.
+                quant_config = copy.deepcopy(mtq.INT8_SMOOTHQUANT_CFG)
+                # INT8_SMOOTHQUANT_CFG and INT8_DEFAULT_CONFIG do not disable the same
+                # modules, so the two INT8 arms would start from different coverage and a
+                # tier comparison would be confounded. Pin one declared base for both.
+                quant_config["quant_cfg"]["*output_quantizer"] = {"enable": False}
             else:
-                quant_config = INT8_DEFAULT_CONFIG
+                quant_config = copy.deepcopy(INT8_DEFAULT_CONFIG)
             if self.config.collect_method != CollectMethod.DEFAULT:
                 reset_set_int8_config(
                     quant_config,
@@ -128,12 +217,12 @@ class Quantizer:
                     backbone=backbone,
                 )
         elif self.config.format == QuantFormat.FP8:
-            quant_config = FP8_DEFAULT_CONFIG
+            quant_config = copy.deepcopy(FP8_DEFAULT_CONFIG)
         elif self.config.format == QuantFormat.FP4:
             if self.model_config.model_type.value.startswith("flux"):
-                quant_config = NVFP4_FP8_MHA_CONFIG
+                quant_config = copy.deepcopy(NVFP4_FP8_MHA_CONFIG)
             else:
-                quant_config = NVFP4_DEFAULT_CONFIG
+                quant_config = copy.deepcopy(NVFP4_DEFAULT_CONFIG)
         else:
             raise NotImplementedError(f"Unknown format {self.config.format}")
         if self.config.quantize_mha:
@@ -167,15 +256,88 @@ class Quantizer:
 
         self.logger.info("Starting model quantization...")
         mtq.quantize(backbone, quant_config, forward_loop)
-        # Get model-specific filter function
-        model_filter_func = get_model_filter_func(self.model_config.model_type)
-        self.logger.info(f"Using filter function for {self.model_config.model_type.value}")
 
-        self.logger.info("Disabling specific quantizers...")
+        model_filter_func = get_model_filter_func(
+            self.model_config.model_type,
+            protect_names=self.protect_names,
+            protect_from_json=self.config.protect_from_json,
+        )
+        if self.config.protect_from_json is not None:
+            self.logger.info(f"Protecting modules listed in {self.config.protect_from_json}")
+        elif self.protect_names is not None:
+            self.logger.info(f"Protecting {len(self.protect_names)} solved modules")
+        else:
+            self.logger.info(f"Using filter function for {self.model_config.model_type.value}")
+
+        # Disabling after calibration rather than before is safe for SmoothQuant:
+        # TensorQuantizer.forward applies pre_quant_scale before the disabled early
+        # return, so a protected layer keeps both halves of the migration (activation
+        # divided, weight multiplied) and stays mathematically equivalent to BF16.
+        self.logger.info("Disabling protected quantizers...")
         mtq.disable_quantizer(backbone, model_filter_func)
 
         self.logger.info("Quantization completed successfully")
         return backbone
+
+    def auto_quantize_model(
+        self,
+        backbone: torch.nn.Module,
+        quant_config: Any,
+        forward_loop: callable,  # type: ignore[valid-type]
+        sensitivity_out: Path | None = None,
+    ) -> torch.nn.Module:
+        """Search per-layer formats instead of applying a declared protection set.
+
+        The score phase is the expensive part, so it is cached through the searcher's
+        own checkpoint: re-running at a different ``effective_bits`` restores the search
+        state and only re-solves, which is what makes several cost points affordable
+        from one scoring pass.
+
+        ``method="gradient"`` needs a backward pass over the whole backbone, which does
+        not fit alongside 22B of weights on a single 80 GB device; ``kl_div`` is
+        forward-only and is therefore the default here.
+        """
+        self.logger.info(
+            "Starting AutoQuantize search: method=%s effective_bits=%.2f",
+            self.config.auto_quantize_method,
+            self.config.effective_bits,
+        )
+        check_lora(backbone)
+
+        # auto_quantize drives its own forward passes over a data loader; the
+        # calibration loop already encapsulates one full pipeline call per prompt, so a
+        # single-item loader per step keeps the two paths consistent.
+        def forward_step(mod, batch):
+            return forward_loop(mod)
+
+        model, search_state = mtq.auto_quantize(
+            backbone,
+            constraints={"effective_bits": self.config.effective_bits},
+            quantization_formats=[quant_config],
+            data_loader=[None],
+            forward_step=forward_step,
+            method=self.config.auto_quantize_method,
+            checkpoint=str(self.config.auto_quantize_checkpoint)
+            if self.config.auto_quantize_checkpoint
+            else None,
+            verbose=True,
+        )
+
+        if sensitivity_out is not None:
+            sensitivity_out.parent.mkdir(parents=True, exist_ok=True)
+            sensitivity_out.write_text(
+                json.dumps(
+                    {
+                        "method": self.config.auto_quantize_method,
+                        "effective_bits_requested": self.config.effective_bits,
+                        "search_state": _jsonable(search_state),
+                    },
+                    indent=2,
+                )
+                + "\n"
+            )
+            self.logger.info(f"Wrote AutoQuantize sensitivity ranking to {sensitivity_out}")
+        return model
 
 
 class ExportManager:
@@ -434,7 +596,122 @@ def create_argument_parser() -> argparse.ArgumentParser:
     quant_group.add_argument(
         "--compress",
         action="store_true",
-        help="Compress quantized weights to reduce memory footprint (FP8/FP4 only)",
+        help=(
+            "Compress quantized weights to reduce memory footprint. Supported for INT8 as "
+            "well as FP8/FP4, but only FP8/FP4 have real-quantized GEMM backends, so an "
+            "INT8 forward dequantizes to BF16 and warns."
+        ),
+    )
+    quant_group.add_argument(
+        "--int8-numerics",
+        type=str,
+        default="static",
+        choices=[n.value for n in Int8Numerics],
+        help=(
+            "INT8 activation numerics: 'static' collects a per-tensor amax during "
+            "calibration, 'per_token_dynamic' computes a scale per token at runtime"
+        ),
+    )
+    quant_group.add_argument(
+        "--ltx-protect-target",
+        type=float,
+        default=None,
+        help=(
+            "Solve an LTX-2 protection tier that retains this fraction of the achievable "
+            "saving on --ltx-protect-metric (1.0 protects only the default set, 0.0 keeps "
+            "everything in high precision). Solved against the live module tree, so the "
+            "tier's predicted cost is reported before calibration starts."
+        ),
+    )
+    quant_group.add_argument(
+        "--ltx-protect-metric",
+        type=str,
+        default="vram",
+        choices=list(METRICS),
+        help=(
+            "Cost axis the protection target refers to. 'vram' is weight bytes and is "
+            "realizable; 'latency' is a projected GEMM-FLOP saving."
+        ),
+    )
+    quant_group.add_argument(
+        "--protect-from-json",
+        type=str,
+        default=None,
+        help=(
+            "Path to a JSON list of module names to keep in high precision. Takes "
+            "precedence over --ltx-protect-target, and is how a solved tier is replayed "
+            "or a sensitivity-derived set is applied."
+        ),
+    )
+    quant_group.add_argument(
+        "--protect-out",
+        type=str,
+        default=None,
+        help=(
+            "Write the solved protection set and its predicted cost here. The file is "
+            "accepted by --protect-from-json, so a solved tier can be replayed exactly."
+        ),
+    )
+
+    auto_group = parser.add_argument_group("AutoQuantize Configuration")
+    auto_group.add_argument(
+        "--auto-quantize",
+        action="store_true",
+        help="Search per-layer quantization formats instead of applying a declared protection set",
+    )
+    auto_group.add_argument(
+        "--effective-bits",
+        type=float,
+        default=8.4,
+        help="AutoQuantize weight-bit budget across the searched modules",
+    )
+    auto_group.add_argument(
+        "--auto-quantize-method",
+        type=str,
+        default="kl_div",
+        choices=["kl_div", "gradient"],
+        help=(
+            "Sensitivity scoring method. 'kl_div' is forward-only; 'gradient' needs a "
+            "backward pass and will not fit a 22B backbone on one 80 GB device."
+        ),
+    )
+    auto_group.add_argument(
+        "--auto-quantize-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Search-state checkpoint. Reused across runs so several effective-bits points "
+            "can be re-solved from one scoring pass."
+        ),
+    )
+    auto_group.add_argument(
+        "--sensitivity-out",
+        type=str,
+        default=None,
+        help="Path to write the AutoQuantize per-layer sensitivity ranking as JSON",
+    )
+
+    cost_group = parser.add_argument_group("Cost Reporting")
+    cost_group.add_argument(
+        "--cost-report",
+        type=str,
+        default=None,
+        help="Path to write the per-variant quantization cost report as JSON",
+    )
+    cost_group.add_argument(
+        "--cost-inventory",
+        type=str,
+        default=None,
+        help=(
+            "Token-annotated linear_inventory.json. Supplies per-module GEMM FLOPs so the "
+            "cost report can add its projected latency columns."
+        ),
+    )
+    cost_group.add_argument(
+        "--gemm-time-share",
+        type=float,
+        default=0.75,
+        help="Measured share of BF16 clip wall-time spent in linear GEMMs, for the projection",
     )
 
     calib_group = parser.add_argument_group("Calibration Configuration")
@@ -523,6 +800,16 @@ def main() -> None:
             lowrank=args.lowrank,
             quantize_mha=args.quantize_mha,
             compress=args.compress,
+            int8_numerics=Int8Numerics(args.int8_numerics),
+            ltx_protect_target=args.ltx_protect_target,
+            ltx_protect_metric=args.ltx_protect_metric,
+            protect_from_json=Path(args.protect_from_json) if args.protect_from_json else None,
+            auto_quantize=args.auto_quantize,
+            effective_bits=args.effective_bits,
+            auto_quantize_method=args.auto_quantize_method,
+            auto_quantize_checkpoint=Path(args.auto_quantize_checkpoint)
+            if args.auto_quantize_checkpoint
+            else None,
         )
 
         if args.prompts_file is not None:
@@ -561,6 +848,7 @@ def main() -> None:
 
         backbone = pipeline_manager.get_backbone()
         export_manager = ExportManager(export_config, logger, pipeline_manager)
+        protect_report: dict[str, Any] | None = None
 
         if export_config.restore_from and export_config.restore_from.exists():
             export_manager.restore_checkpoint()
@@ -571,15 +859,34 @@ def main() -> None:
             batched_prompts = calibrator.load_and_batch_prompts()
 
             quantizer = Quantizer(quant_config, model_config, logger)
+            # Solved before calibration: the tier is a property of the model and the clip
+            # geometry, not of the calibration data, and a target that lands somewhere
+            # unintended should fail before a calibration pass is spent on it.
+            protect_report = quantizer.solve_protection_tier(backbone, model_config.extra_params)
+            if protect_report is not None and args.protect_out:
+                Path(args.protect_out).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.protect_out).write_text(
+                    json.dumps({**protect_report, "protect": quantizer.protect_names}, indent=2)
+                    + "\n"
+                )
+                logger.info(f"Wrote the solved protection set to {args.protect_out}")
+
             backbone_quant_config = quantizer.get_quant_config(calib_config.n_steps, backbone)
 
             # Pipe loads the ckpt just before the inference.
             def forward_loop(mod):
                 calibrator.run_calibration(batched_prompts)
 
-            quantizer.quantize_model(backbone, backbone_quant_config, forward_loop)
+            if quant_config.auto_quantize:
+                quantizer.auto_quantize_model(
+                    backbone,
+                    backbone_quant_config,
+                    forward_loop,
+                    sensitivity_out=Path(args.sensitivity_out) if args.sensitivity_out else None,
+                )
+            else:
+                quantizer.quantize_model(backbone, backbone_quant_config, forward_loop)
 
-            # Compress model weights if requested (only for FP8/FP4)
             if quant_config.compress:
                 logger.info("Compressing model weights to reduce memory footprint...")
                 mtq.compress(backbone)
@@ -593,6 +900,39 @@ def main() -> None:
         )
 
         pipeline_manager.print_quant_summary()
+
+        if args.cost_report:
+            write_quant_cost_report(
+                backbone,
+                Path(args.cost_report),
+                logger=logger,
+                inventory_path=Path(args.cost_inventory) if args.cost_inventory else None,
+                gemm_time_share=args.gemm_time_share,
+                meta={
+                    "model": model_type.value,
+                    "format": quant_config.format.value,
+                    "algo": quant_config.algo.value,
+                    "int8_numerics": quant_config.int8_numerics.value,
+                    "alpha": quant_config.alpha,
+                    "protect_target": quant_config.ltx_protect_target,
+                    "protect_metric": quant_config.ltx_protect_metric
+                    if quant_config.ltx_protect_target is not None
+                    else None,
+                    # The predicted cost of the solved tier, kept next to the measured cost
+                    # so the two can be compared without joining files.
+                    "protect_predicted": protect_report,
+                    "protect_from_json": str(quant_config.protect_from_json)
+                    if quant_config.protect_from_json
+                    else None,
+                    "auto_quantize": quant_config.auto_quantize,
+                    "effective_bits_requested": quant_config.effective_bits
+                    if quant_config.auto_quantize
+                    else None,
+                    "compressed": quant_config.compress,
+                    "calib_size": calib_config.calib_size,
+                    "n_steps": calib_config.n_steps,
+                },
+            )
 
         export_manager.export_onnx(
             pipe,
