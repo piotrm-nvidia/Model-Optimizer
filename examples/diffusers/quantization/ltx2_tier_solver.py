@@ -502,21 +502,25 @@ def _trace(
     means comparing whole traces: a tier that protects less always shows a larger saving
     on both axes, which says nothing about whether its ordering was better.
     """
-    blocks = sorted({entry.block for entry in inventory if entry.block is not None})
-    ramp = block_ramp_order(blocks)
+    # Per class, not global: the connectors are 8 blocks deep against the main stack's 48,
+    # so a shared ramp would add steps for blocks a class does not have - recording block
+    # indices that do not exist and padding the walk with steps that protect nothing.
+    class_blocks: dict[str, set[int]] = {}
+    for entry in inventory:
+        if entry.block is not None:
+            class_blocks.setdefault(entry.layer_class, set()).add(entry.block)
+
     current = ProtectionSet()
     trace = [(current.copy(), cost_of(inventory, current.protects), "none")]
 
     for layer_class, _ in protection_order(inventory, metric, sensitivity_prior):
-        has_blocks = any(
-            entry.layer_class == layer_class and entry.block is not None for entry in inventory
-        )
-        if not has_blocks:
+        blocks = class_blocks.get(layer_class)
+        if not blocks:
             current = current.copy()
             current.whole_classes.add(layer_class)
             trace.append((current.copy(), cost_of(inventory, current.protects), layer_class))
             continue
-        for block in ramp:
+        for block in block_ramp_order(sorted(blocks)):
             current = current.copy()
             current.partial.setdefault(layer_class, set()).add(block)
             trace.append(
