@@ -150,6 +150,11 @@ class Calibrator:
             "images": extra_params.get("images", []),
             "tiling_config": extra_params.get("tiling_config", TilingConfig.default()),
         }
+        # Both stages denoise audio alongside video, so one call exercises the audio
+        # branch of the backbone as well. The returned pair is a lazy video-decode
+        # iterator plus decoded audio; neither is consumed because the VAEs are outside
+        # the quantized backbone. Whether that is enough is not assumed - the coverage
+        # audit after calibration fails the run on any quantizer left without an amax.
         self.pipe(prompt=prompt, **kwargs)
 
     def _run_ltx_video_calibration(

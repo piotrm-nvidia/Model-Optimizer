@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from calib_coverage import check_calibration_coverage
 from calibration import Calibrator
 from config import (
     FP8_DEFAULT_CONFIG,
@@ -726,6 +727,24 @@ def create_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Calibrate using prompts in the file instead of the default dataset.",
     )
+    calib_group.add_argument(
+        "--calib-coverage-out",
+        type=str,
+        default=None,
+        help=(
+            "Write the per-quantizer calibration coverage audit here. The audit itself "
+            "always runs after calibration; this only keeps its record next to the run."
+        ),
+    )
+    calib_group.add_argument(
+        "--allow-uncalibrated",
+        action="store_true",
+        help=(
+            "Continue when the audit finds enabled quantizers that never collected an "
+            "amax. Off by default: such a layer is quantized against its initialization "
+            "scale, and the saved checkpoint does not record that it was."
+        ),
+    )
 
     export_group = parser.add_argument_group("Export Configuration")
     export_group.add_argument(
@@ -886,6 +905,15 @@ def main() -> None:
                 )
             else:
                 quantizer.quantize_model(backbone, backbone_quant_config, forward_loop)
+
+            # Before compression, which folds the scales in and makes a missing amax
+            # indistinguishable from a collected one.
+            check_calibration_coverage(
+                backbone,
+                out_path=Path(args.calib_coverage_out) if args.calib_coverage_out else None,
+                logger=logger,
+                fail_on_uncalibrated=not args.allow_uncalibrated,
+            )
 
             if quant_config.compress:
                 logger.info("Compressing model weights to reduce memory footprint...")
