@@ -40,6 +40,29 @@ INT8_DEFAULT_CONFIG = {
     "algorithm": "max",
 }
 
+# W8A8 SmoothQuant, derived from INT8_DEFAULT_CONFIG so the two static INT8 arms differ
+# only in what SmoothQuant itself requires.
+#
+# The core INT8_SMOOTHQUANT_CFG is not that base. It carries a different skip list -
+# no "default": disable, so softmax and BMM quantizers that INT8_DEFAULT_CONFIG leaves
+# off would be enabled here - plus a set of LLM-shaped exclusions (lm_head, MoE routers,
+# mamba conv1d) that mean nothing for a video DiT. Comparing a tier under one base
+# against a tier under the other would be comparing coverage, not numerics.
+#
+# The one genuine difference: SmoothQuant needs a per-tensor activation quantizer.
+# model_calib.smoothquant only converts a quantizer whose axis is None (to -1 for the
+# per-channel collection, back to None afterwards), so leaving axis 0 here would collect
+# the wrong statistic and silently smooth against it.
+INT8_SMOOTHQUANT_CONFIG = {
+    "quant_cfg": {
+        "*weight_quantizer": {"num_bits": 8, "axis": 0},
+        "*input_quantizer": {"num_bits": 8, "axis": None},
+        "*output_quantizer": {"enable": False},
+        "default": {"enable": False},
+    },
+    "algorithm": "smoothquant",
+}
+
 # W8A8 with per-output-channel weights and per-token dynamic activations. Dynamic
 # activation scales are computed at runtime from each token's own range, so there is
 # nothing to calibrate on the activation side and no SmoothQuant migration to tune,

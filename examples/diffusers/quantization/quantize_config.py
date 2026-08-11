@@ -87,7 +87,10 @@ class QuantizationConfig:
     algo: QuantAlgo = QuantAlgo.MAX
     percentile: float = 1.0
     collect_method: CollectMethod = CollectMethod.DEFAULT
-    alpha: float = 1.0  # SmoothQuant alpha
+    # SmoothQuant migration strength. None rather than a number: the previous 1.0 default
+    # migrated the entire activation range into the weights on every run that did not say
+    # otherwise, which is a choice of experiment, not a fallback.
+    alpha: float | None = None
     lowrank: int = 32  # SVDQuant lowrank
     quantize_mha: bool = False
     # INT8 is allowed here. The core library supports INT8 real quantization
@@ -112,6 +115,13 @@ class QuantizationConfig:
 
     def validate(self) -> None:
         """Validate configuration consistency."""
+        if self.algo == QuantAlgo.SMOOTHQUANT and self.alpha is None:
+            raise ValueError(
+                "--quant-algo smoothquant requires an explicit --alpha. It sets how much "
+                "of the activation range is migrated into the weights (1.0 all of it, "
+                "0.5 the paper's balance point), so an unstated alpha is an unstated "
+                "experiment."
+            )
         if self.format == QuantFormat.FP8 and self.collect_method != CollectMethod.DEFAULT:
             raise NotImplementedError("Only 'default' collect method is implemented for FP8.")
         if self.quantize_mha and self.format == QuantFormat.INT8:

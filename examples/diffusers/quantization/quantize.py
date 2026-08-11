@@ -29,6 +29,7 @@ from config import (
     FP8_DEFAULT_CONFIG,
     INT8_DEFAULT_CONFIG,
     INT8_PER_CHANNEL_PER_TOKEN_CONFIG,
+    INT8_SMOOTHQUANT_CONFIG,
     NVFP4_DEFAULT_CONFIG,
     NVFP4_FP8_MHA_CONFIG,
     reset_set_int8_config,
@@ -199,14 +200,10 @@ class Quantizer:
             if self.config.int8_numerics == Int8Numerics.PER_TOKEN_DYNAMIC:
                 quant_config = copy.deepcopy(INT8_PER_CHANNEL_PER_TOKEN_CONFIG)
             elif self.config.algo == QuantAlgo.SMOOTHQUANT:
-                # Deep-copied because set_quant_config_attr mutates in place and this is
-                # the process-wide mtq singleton; the previous aliasing meant a second
-                # get_quant_config call in one process saw the first call's edits.
-                quant_config = copy.deepcopy(mtq.INT8_SMOOTHQUANT_CFG)
-                # INT8_SMOOTHQUANT_CFG and INT8_DEFAULT_CONFIG do not disable the same
-                # modules, so the two INT8 arms would start from different coverage and a
-                # tier comparison would be confounded. Pin one declared base for both.
-                quant_config["quant_cfg"]["*output_quantizer"] = {"enable": False}
+                # Deep-copied because set_quant_config_attr mutates in place, and a second
+                # get_quant_config call in one process would otherwise see the first
+                # call's edits.
+                quant_config = copy.deepcopy(INT8_SMOOTHQUANT_CONFIG)
             else:
                 quant_config = copy.deepcopy(INT8_DEFAULT_CONFIG)
             if self.config.collect_method != CollectMethod.DEFAULT:
@@ -589,7 +586,16 @@ def create_argument_parser() -> argparse.ArgumentParser:
         choices=[c.value for c in CollectMethod],
         help="Calibration collection method, works for INT8, not including smoothquant",
     )
-    quant_group.add_argument("--alpha", type=float, default=1.0, help="SmoothQuant alpha parameter")
+    quant_group.add_argument(
+        "--alpha",
+        type=float,
+        default=None,
+        help=(
+            "SmoothQuant migration strength, required with --quant-algo smoothquant. "
+            "Has no default because it decides the experiment: alpha=1.0 moves the whole "
+            "activation range into the weights, 0.5 is the paper's balance point."
+        ),
+    )
     quant_group.add_argument("--lowrank", type=int, default=32, help="SVDQuant lowrank parameter")
     quant_group.add_argument(
         "--quantize-mha", action="store_true", help="Quantizing MHA into FP8 if its True"
