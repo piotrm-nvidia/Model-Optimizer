@@ -17,6 +17,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import torch
 from models_utils import MODEL_DEFAULTS, ModelType
 from pipeline_manager import PipelineManager
 from quantize_config import CalibrationConfig
@@ -186,6 +187,24 @@ class Calibrator:
         # the quantized backbone. Whether that is enough is not assumed - the coverage
         # audit after calibration fails the run on any quantizer left without an amax.
         self.pipe(prompt=prompt, **kwargs)
+        self._restore_backbone_device()
+
+    def _restore_backbone_device(self) -> None:
+        """Leave the backbone on the accelerator once a calibration sample is done.
+
+        Single-GPU LTX runs park the backbone on CPU while the text encoder is resident,
+        which is what lets a 19B model and Gemma share one device. SmoothQuant's
+        postprocess then multiplies each weight by the activation amax collected during
+        the forward pass, and those live wherever the forward ran - so a backbone left on
+        CPU meets CUDA amax values and the run dies between calibration and quantization.
+        Max calibration never touches both tensors at once, which is why the FP8 arms
+        never hit this.
+        """
+        transformer = getattr(self.pipeline_manager, "_transformer", None)
+        if transformer is None or not torch.cuda.is_available():
+            return
+        if next(transformer.parameters()).device.type != "cuda":
+            transformer.to("cuda")
 
     def _run_ltx_video_calibration(
         self, prompt_batch: list[str], extra_args: dict[str, Any]
