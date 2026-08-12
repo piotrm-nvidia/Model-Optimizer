@@ -172,7 +172,13 @@ class Calibrator:
             "video_guider_params": video_guider_params,
             "audio_guider_params": audio_guider_params,
             "images": extra_params.get("images", []),
-            "tiling_config": extra_params.get("tiling_config", TilingConfig.default()),
+            # Newer LTX turns TilingConfig into a union of tile-size and tile-count
+            # configs with no default constructor. Untiled is the right fallback here:
+            # tiling only shapes VAE decode, and calibration never consumes the decode.
+            "tiling_config": extra_params.get(
+                "tiling_config",
+                TilingConfig.default() if hasattr(TilingConfig, "default") else None,
+            ),
         }
         # Both stages denoise audio alongside video, so one call exercises the audio
         # branch of the backbone as well. The returned pair is a lazy video-decode
