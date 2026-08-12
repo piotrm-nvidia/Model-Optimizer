@@ -119,12 +119,35 @@ class Calibrator:
 
         self.pipe(prompt=prompt_batch, **kwargs).frames
 
+    @staticmethod
+    def _ltx2_guider_params(extra_params: dict[str, Any]) -> tuple[Any, Any]:
+        """Resolve the guidance settings calibration should sample under.
+
+        Guidance decides how many forward passes each step makes and how far the
+        conditional and unconditional branches diverge, so it shapes the activation
+        ranges the quantizer measures. Calibrating under different guidance than the
+        board later generates with would leave the amax values describing a
+        distribution the model never sees again.
+
+        Older LTX exported one flat default; newer LTX resolves the preset from the
+        checkpoint's declared ``model_version``, which is what picks the LTX-2.3
+        settings for a 2.3 master rather than the 2.0 ones.
+        """
+        try:
+            from ltx_pipelines.utils.constants import (
+                DEFAULT_AUDIO_GUIDER_PARAMS,
+                DEFAULT_VIDEO_GUIDER_PARAMS,
+            )
+
+            return DEFAULT_VIDEO_GUIDER_PARAMS, DEFAULT_AUDIO_GUIDER_PARAMS
+        except ImportError:
+            from ltx_pipelines.utils.constants import detect_params
+
+            params = detect_params(str(extra_params["checkpoint_path"]))
+            return params.video_guider_params, params.audio_guider_params
+
     def _run_ltx2_calibration(self, prompt_batch: list[str], extra_args: dict[str, Any]) -> None:
         from ltx_core.model.video_vae import TilingConfig
-        from ltx_pipelines.utils.constants import (
-            DEFAULT_AUDIO_GUIDER_PARAMS,
-            DEFAULT_VIDEO_GUIDER_PARAMS,
-        )
 
         # The LTX-2 pipeline takes a single prompt, so a batch larger than one would have
         # its remaining prompts silently dropped and the run would quietly calibrate on
@@ -135,6 +158,7 @@ class Calibrator:
         )
         prompt = prompt_batch[0]
         extra_params = self.pipeline_manager.config.extra_params
+        video_guider_params, audio_guider_params = self._ltx2_guider_params(extra_params)
         kwargs = {
             "negative_prompt": extra_args.get(
                 "negative_prompt", "worst quality, inconsistent motion, blurry, jittery, distorted"
@@ -145,8 +169,8 @@ class Calibrator:
             "num_frames": extra_params.get("num_frames", extra_args.get("num_frames", 121)),
             "frame_rate": extra_params.get("frame_rate", extra_args.get("frame_rate", 24.0)),
             "num_inference_steps": self.config.n_steps,
-            "video_guider_params": DEFAULT_VIDEO_GUIDER_PARAMS,
-            "audio_guider_params": DEFAULT_AUDIO_GUIDER_PARAMS,
+            "video_guider_params": video_guider_params,
+            "audio_guider_params": audio_guider_params,
             "images": extra_params.get("images", []),
             "tiling_config": extra_params.get("tiling_config", TilingConfig.default()),
         }
