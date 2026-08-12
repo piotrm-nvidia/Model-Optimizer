@@ -201,10 +201,40 @@ class PipelineManager:
     def _ensure_ltx2_transformer_cached(self) -> None:
         if not self.pipe:
             raise RuntimeError("Pipeline not created. Call create_pipeline() first.")
-        if self._transformer is None:
+        if self._transformer is not None:
+            return
+        if hasattr(self.pipe, "stage_1_model_ledger"):
             transformer = self.pipe.stage_1_model_ledger.transformer()
             self.pipe.stage_1_model_ledger.transformer = lambda: transformer
             self._transformer = transformer
+            return
+        self._transformer = self._pin_ltx2_diffusion_stages()
+
+    def _pin_ltx2_diffusion_stages(self) -> torch.nn.Module:
+        """Hold one transformer across the whole run on the DiffusionStage pipeline API.
+
+        Newer LTX gives each stage a builder and rebuilds the transformer per call,
+        freeing it on exit. Quantization cannot live with that: the quantizers, their
+        calibrated amax values, and the compressed weights are attached to a module
+        instance, so a rebuild silently discards the calibration and generates from
+        unquantized weights. Building once and handing the same instance to every stage
+        is what makes the measured number describe the checkpoint that was calibrated.
+        """
+        from contextlib import contextmanager
+
+        transformer = self.pipe.stage_1._build_transformer()
+
+        @contextmanager
+        def pinned_transformer(**_: object) -> Iterator[torch.nn.Module]:
+            yield transformer
+
+        # Both stages share it. With an already-distilled master no distilled LoRA is
+        # applied on top, so the two stages differ in nothing that reaches the weights.
+        for stage_name in ("stage_1", "stage_2"):
+            stage = getattr(self.pipe, stage_name, None)
+            if stage is not None:
+                stage._transformer_ctx = pinned_transformer
+        return transformer
 
     def _create_ltx2_pipeline(self) -> Any:
         params = dict(self.config.extra_params)
