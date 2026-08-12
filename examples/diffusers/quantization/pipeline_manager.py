@@ -247,13 +247,23 @@ class PipelineManager:
                 "No distilled_lora_path given; assuming the checkpoint is already distilled."
             )
         pipeline_kwargs = {
-            "checkpoint_path": str(checkpoint_path),
             "distilled_lora": distilled_lora,
             "spatial_upsampler_path": str(spatial_upsampler_path),
-            "gemma_root": str(gemma_root),
             "loras": [],
             "quantization": QuantizationPolicy.fp8_cast() if fp8_quantization else None,
         }
+        # Recent LTX collapses the component paths into one ModelPaths argument. The
+        # LTX-2.3 masters need that checkout, while the FP8 baselines are pinned to a
+        # revision that predates the module, so both call shapes have to keep working.
+        try:
+            from ltx_pipelines.utils.model_paths import ModelPaths
+
+            pipeline_kwargs["model_paths"] = ModelPaths.from_monolith(
+                str(checkpoint_path), str(gemma_root)
+            )
+        except ImportError:
+            pipeline_kwargs["checkpoint_path"] = str(checkpoint_path)
+            pipeline_kwargs["gemma_root"] = str(gemma_root)
         pipeline_kwargs.update(params)
         return TI2VidTwoStagesPipeline(**pipeline_kwargs)
 
