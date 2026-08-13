@@ -158,7 +158,11 @@ def build_quant_cost_report(
 
         inventory_entry = _inventory_lookup(inventory, name)
         if inventory_entry is not None:
-            flops = inventory_entry["flops_per_step"]
+            # The tier solver writes the per-step FLOP count as "flops"; older inventories
+            # spell it "flops_per_step".
+            flops = inventory_entry.get("flops_per_step", inventory_entry.get("flops"))
+            if flops is None:
+                raise KeyError(f"inventory entry for {name} carries no FLOP count")
             entry["flops_per_step"] = flops
             entry["tokens"] = inventory_entry["tokens"]
             entry["layer_class"] = inventory_entry.get("layer_class")
